@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use jni::objects::{AutoLocal, JClass};
+use jni::objects::AutoLocal;
 
 use crate::{jvm::JavaObjectExt, plumbing::with_jni_env, JavaObject, Jvm, JvmOp, Local};
 
@@ -69,20 +69,23 @@ where
         input: J::Input<'jvm>,
     ) -> crate::Result<'jvm, Self::Output<'jvm>> {
         let instance = self.op.execute_with(jvm, input)?;
-        let jobject = instance.as_ref().as_jobject();
+        let instance_raw = instance.as_ref().as_raw();
 
         let class = To::class(jvm)?;
-        let class = class.as_jobject();
-        let class: &JClass = (&*class).into();
+        let class_raw = class.as_raw();
 
-        let env = jvm.to_env();
-        if !with_jni_env(env, |env| env.is_instance_of(&jobject, class))? {
-            return Ok(Err(instance));
+        let raw = jvm.as_raw();
+        let is_inst = unsafe { (**raw).IsInstanceOf.unwrap()(raw, instance_raw, class_raw) };
+
+        if is_inst == jni_sys::JNI_TRUE {
+            // XX: fix to new local
+            let env = jvm.to_env();
+            let local = with_jni_env(env, |env| env.new_local_ref(instance.as_ref().as_jobject()))?;
+            // Safety: just shown that jobject instanceof To::class
+            Ok(Ok(unsafe { Local::from_jni(AutoLocal::new(local, env)) }))
+        } else {
+            Ok(Err(instance))
         }
-
-        let local = with_jni_env(env, |env| env.new_local_ref(jobject))?;
-        // Safety: just shown that jobject instanceof To::class
-        Ok(Ok(unsafe { Local::from_jni(AutoLocal::new(local, env)) }))
     }
 }
 
@@ -142,13 +145,16 @@ where
 
         if cfg!(debug_assertions) {
             let to_class = To::class(jvm)?;
-            let to_class = to_class.as_jobject();
-            let to_class: &JClass = (&*to_class).into();
+            let to_class_raw = to_class.as_raw();
 
-            let env = jvm.to_env();
-            assert!(!jobject.is_null());
-            let class = env.get_object_class(&jobject).unwrap();
-            assert!(env.is_assignable_from(class, to_class).unwrap());
+            let instance_raw = instance.as_ref().as_raw();
+            assert!(!instance_raw.is_null());
+
+            let raw = jvm.as_raw();
+            assert!(
+                unsafe { (**raw).IsInstanceOf.unwrap()(raw, instance_raw, to_class_raw) }
+                    == jni_sys::JNI_TRUE
+            );
         }
 
         let env = jvm.to_env();

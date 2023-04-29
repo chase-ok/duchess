@@ -2,15 +2,13 @@ use std::marker::PhantomData;
 
 use crate::{
     cast::Upcast,
-    java::lang::Class,
+    error::check_exception,
+    java::{self, lang::Class},
     ops::IntoJava,
-    plumbing::{convert_non_throw_jni_error, with_jni_env, JavaObjectExt},
-    IntoRust, JavaObject, JavaType, Jvm, JvmOp, Local,
+    plumbing::JavaObjectExt,
+    Error, IntoRust, IntoScalar, JavaObject, JavaType, Jvm, JvmOp, Local, ScalarMethod,
 };
-use jni::{
-    errors::JniError,
-    objects::{AutoLocal, JObject, JPrimitiveArray},
-};
+use jni::objects::{AutoLocal, JObject};
 
 pub struct JavaArray<T: JavaType> {
     _element: PhantomData<T>,
@@ -23,24 +21,100 @@ unsafe impl<T: JavaType> JavaObject for JavaArray<T> {
 }
 
 // Upcasts
-
 unsafe impl<T: JavaType> Upcast<JavaArray<T>> for JavaArray<T> {}
+// all arrays extend Object
+unsafe impl<T: JavaType> Upcast<java::lang::Object> for JavaArray<T> {}
+
+// XX: length isn't a normal field or method, so hand-generating the traits
+pub trait JavaArrayExt<T: JavaType>: JvmOp {
+    type Length: ScalarMethod<Self, jni_sys::jsize>;
+    fn length(self) -> Self::Length;
+}
+
+impl<This, T> JavaArrayExt<T> for This
+where
+    This: JvmOp,
+    for<'jvm> This::Output<'jvm>: AsRef<JavaArray<T>>,
+    T: JavaType,
+{
+    type Length = Length<Self, T>;
+    fn length(self) -> Self::Length {
+        Length {
+            this: self,
+            element: PhantomData,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Length<This, T> {
+    this: This,
+    element: PhantomData<T>,
+}
+
+impl<This, T> JvmOp for Length<This, T>
+where
+    This: JvmOp,
+    for<'jvm> This::Output<'jvm>: AsRef<JavaArray<T>>,
+    T: JavaType,
+{
+    type Input<'jvm> = This::Input<'jvm>;
+    type Output<'jvm> = jni_sys::jsize;
+
+    fn execute_with<'jvm>(
+        self,
+        jvm: &mut Jvm<'jvm>,
+        input: Self::Input<'jvm>,
+    ) -> crate::Result<'jvm, Self::Output<'jvm>> {
+        let this = self.this.execute_with(jvm, input)?;
+        let this = this.as_ref().as_raw();
+
+        let raw = jvm.as_raw();
+        // XX: safety: not null?
+        let len = unsafe { (**raw).GetArrayLength.unwrap()(raw, this) };
+        Ok(len)
+    }
+}
 
 macro_rules! primivite_array {
-    ($([$rust:ty]: $new_fn:ident $get_fn:ident $set_fn:ident,)*) => {
+    ($([$rust:ty]: $java_name:literal $java_ty:ident $new_fn:ident $get_fn:ident $set_fn:ident,)*) => {
         $(
             impl IntoJava<JavaArray<$rust>> for &[$rust] {
                 type Output<'jvm> = Local<'jvm, JavaArray<$rust>>;
 
                 fn into_java<'jvm>(self, jvm: &mut Jvm<'jvm>) -> crate::Result<'jvm, Self::Output<'jvm>> {
-                    let env = jvm.to_env();
                     let Ok(len) = self.len().try_into() else {
-                        return Err(convert_non_throw_jni_error(
-                            jni::errors::Error::JniCall(JniError::InvalidArguments)));
+                        return Err(Error::SliceTooLong(self.len()))
                     };
-                    let array = with_jni_env(env, |env| env.$new_fn(len))?;
-                    with_jni_env(env, |env| env.$set_fn(&array, 0, self))?;
-                    unsafe { Ok(Local::from_jni(AutoLocal::new(JObject::from(array), &env))) }
+            
+                    let raw = jvm.as_raw();
+                    let array = unsafe { (**raw).$new_fn.unwrap()(raw, len) };
+                    if array.is_null() {
+                        check_exception(jvm)?; // Likely threw OutOfMemoryError
+                        return Err(Error::JvmInternal(format!(
+                            "failed to allocate `{}[{}]`",
+                            $java_name,
+                            len
+                        )));
+                    }
+            
+                    // XX: safety
+                    unsafe {
+                        (**raw).$set_fn.unwrap()(
+                            raw,
+                            array,
+                            0,
+                            len,
+                            self.as_ptr().cast::<jni_sys::$java_ty>(),
+                        );
+                    }
+            
+                    unsafe {
+                        Ok(Local::from_jni(AutoLocal::new(
+                            JObject::from_raw(array),
+                            jvm.to_env(),
+                        )))
+                    }
                 }
             }
 
@@ -50,17 +124,26 @@ macro_rules! primivite_array {
                 for<'jvm> J::Output<'jvm>: AsRef<JavaArray<$rust>>,
             {
                 fn into_rust<'jvm>(self, jvm: &mut Jvm<'jvm>) -> $crate::Result<'jvm, Vec<$rust>> {
-                    let object = self.execute_with(jvm, ())?;
+                    let array = self.execute_with(jvm, ())?;
+                    // XX: can we avoid somehow?
+                    let array = jvm.local(array.as_ref());
 
-                    let env = jvm.to_env();
-                    // XX: safety, is this violating any rules? right way to cast?
-                    let array_object = unsafe { JPrimitiveArray::from_raw(object.as_ref().as_jobject().as_raw()) };
-                    let len = with_jni_env(env, |env| env.get_array_length(&array_object))? as usize;
-
-                    // XX: use MaybeUninit somehow to avoid the zero'ing
-                    let mut vec = vec![Default::default(); len];
-                    with_jni_env(env, |env| env.$get_fn(&array_object, 0, &mut vec))?;
-
+                    let len = array.length().execute(jvm)?;
+                    let mut vec = Vec::<$rust>::with_capacity(len as usize);
+            
+                    let raw = jvm.as_raw();
+                    unsafe {
+                        (**raw).$get_fn.unwrap()(
+                            raw,
+                            array.as_raw(),
+                            0,
+                            len,
+                            vec.as_mut_ptr().cast::<jni_sys::$java_ty>(),
+                        );
+                        vec.set_len(len as usize);
+                    }
+                    check_exception(jvm)?;
+            
                     Ok(vec)
                 }
             }
@@ -70,52 +153,11 @@ macro_rules! primivite_array {
 
 // Bool is represented as u8 in JNI
 primivite_array! {
-    [i8]: new_byte_array get_byte_array_region set_byte_array_region,
-    [i16]: new_short_array get_short_array_region set_short_array_region,
-    [i32]: new_int_array get_int_array_region set_int_array_region,
-    [i64]: new_long_array get_long_array_region set_long_array_region,
-    [f32]: new_float_array get_float_array_region set_float_array_region,
-    [f64]: new_double_array get_double_array_region set_double_array_region,
-}
-
-// Bool is represented as u8 in JNI
-impl IntoJava<JavaArray<bool>> for &[bool] {
-    type Output<'jvm> = Local<'jvm, JavaArray<bool>>;
-
-    fn into_java<'jvm>(self, jvm: &mut Jvm<'jvm>) -> crate::Result<'jvm, Self::Output<'jvm>> {
-        let env = jvm.to_env();
-        let Ok(len) = self.len().try_into() else {
-            return Err(convert_non_throw_jni_error(
-                jni::errors::Error::JniCall(JniError::InvalidArguments)));
-        };
-        let array = with_jni_env(env, |env| env.new_boolean_array(len))?;
-        // XX: is it possible to avoid this copy if we can make assumptions about bool repr?
-        let u8s = self.iter().map(|&b| b as u8).collect::<Vec<_>>();
-        with_jni_env(env, |env| env.set_boolean_array_region(&array, 0, &u8s))?;
-        unsafe { Ok(Local::from_jni(AutoLocal::new(JObject::from(array), &env))) }
-    }
-}
-
-impl<J> IntoRust<Vec<bool>> for J
-where
-    for<'jvm> J: JvmOp<Input<'jvm> = ()>,
-    for<'jvm> J::Output<'jvm>: AsRef<JavaArray<bool>>,
-{
-    fn into_rust<'jvm>(self, jvm: &mut Jvm<'jvm>) -> crate::Result<'jvm, Vec<bool>> {
-        let object = self.execute_with(jvm, ())?;
-
-        let env = jvm.to_env();
-        // XX: safety, is this violating any rules? right way to cast?
-        let array_object =
-            unsafe { JPrimitiveArray::from_raw(object.as_ref().as_jobject().as_raw()) };
-        let len = with_jni_env(env, |env| env.get_array_length(&array_object))? as usize;
-
-        // XX: use MaybeUninit somehow to avoid the zero'ing
-        let mut u8_vec = vec![0u8; len];
-        with_jni_env(env, |env| {
-            env.get_boolean_array_region(&array_object, 0, &mut u8_vec)
-        })?;
-
-        Ok(u8_vec.into_iter().map(|x| x != 0).collect())
-    }
+    [i8]: "boolean" jboolean NewBooleanArray GetBooleanArrayRegion SetBooleanArrayRegion,
+    [u16]: "char" jchar NewCharArray GetCharArrayRegion SetCharArrayRegion,
+    [i16]: "short" jshort NewShortArray GetShortArrayRegion SetShortArrayRegion,
+    [i32]: "int" jint NewIntArray GetIntArrayRegion SetIntArrayRegion,
+    [i64]: "long" jlong NewLongArray GetLongArrayRegion SetLongArrayRegion,
+    [f32]: "float" jfloat NewFloatArray GetFloatArrayRegion SetFloatArrayRegion,
+    [f64]: "double" jdouble NewDoubleArray GetDoubleArrayRegion SetDoubleArrayRegion,
 }

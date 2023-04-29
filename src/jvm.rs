@@ -17,7 +17,7 @@ use std::{
 
 use jni::{
     objects::{AutoLocal, GlobalRef, JObject, JValueOwned},
-    sys, InitArgsBuilder, JNIEnv, JavaVM,
+    InitArgsBuilder, JNIEnv, JavaVM,
 };
 use once_cell::sync::{Lazy, OnceCell};
 
@@ -149,6 +149,11 @@ impl<'jvm> Jvm<'jvm> {
         &mut self.env
     }
 
+    /// XX
+    pub fn as_raw(&self) -> *mut jni_sys::JNIEnv {
+        self.env.get_raw()
+    }
+
     pub fn local<R>(&mut self, r: &R) -> Local<'jvm, R>
     where
         R: JavaObject,
@@ -213,6 +218,7 @@ pub trait JavaObjectExt: Sized {
 
     fn from_jobject<'a>(obj: &'a JObject<'a>) -> Option<&'a Self>;
     fn as_jobject(&self) -> BorrowedJObject<'_>;
+    fn as_raw(&self) -> jni_sys::jobject;
 }
 impl<T: JavaObject> JavaObjectExt for T {
     fn from_jobject<'a>(obj: &'a JObject<'a>) -> Option<&'a Self> {
@@ -230,7 +236,7 @@ impl<T: JavaObject> JavaObjectExt for T {
     }
 
     fn as_jobject(&self) -> BorrowedJObject<'_> {
-        let raw = (self as *const Self).cast_mut().cast::<sys::_jobject>();
+        let raw = self.as_raw();
 
         // SAFETY: the only way to get a `&Self` is by calling `Self::from_jobject` (trait rule #1),
         // so reconstructing the original JObject passed to `from_jni` should also be safe.
@@ -239,6 +245,10 @@ impl<T: JavaObject> JavaObjectExt for T {
         // We must wrap the JObject to prevent anyone from calling `delete_local_ref` on it;
         // otherwise, `self` could become dangling
         BorrowedJObject::new(obj)
+    }
+
+    fn as_raw(&self) -> jni_sys::jobject {
+        (self as *const Self).cast_mut().cast::<jni_sys::_jobject>()
     }
 }
 
@@ -282,6 +292,7 @@ scalar! {
     bool: "[Z",
     i8:   "[B",
     i16:  "[S",
+    u16:  "[C",
     i32:  "[I",
     i64:  "[J",
     f32:  "[F",

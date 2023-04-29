@@ -1,4 +1,7 @@
-use std::{fmt::Debug, result};
+use std::{
+    fmt::{Debug, Display},
+    result,
+};
 
 use jni::{
     objects::{AutoLocal, JObject},
@@ -22,6 +25,15 @@ pub enum Error<T> {
     #[error("Java invocation threw")]
     Thrown(T),
 
+    /// XX: name?
+    #[error("{0}")]
+    JvmInternal(String),
+
+    #[error(
+        "slice was too long (`{0}`) to convert to a Java array, which are limited to `i32::MAX`"
+    )]
+    SliceTooLong(usize),
+
     /// An internal JNI error occurred
     #[error(transparent)]
     Jni(#[from] JniError),
@@ -29,10 +41,7 @@ pub enum Error<T> {
 
 impl<T> Debug for Error<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Thrown(_t) => f.debug_tuple("Thrown").finish(),
-            Self::Jni(e) => e.fmt(f),
-        }
+        Display::fmt(self, f)
     }
 }
 
@@ -40,6 +49,8 @@ impl<'jvm> Error<Local<'jvm, Throwable>> {
     pub fn into_global(self, jvm: &mut Jvm<'jvm>) -> Error<Global<Throwable>> {
         match self {
             Error::Thrown(t) => Error::Thrown(jvm.global(&t)),
+            Error::JvmInternal(m) => Error::JvmInternal(m),
+            Error::SliceTooLong(s) => Error::SliceTooLong(s),
             Error::Jni(e) => Error::Jni(e),
         }
     }
@@ -68,6 +79,24 @@ impl<T> From<jni::errors::JniError> for Error<T> {
     }
 }
 
+pub fn check_exception<'jvm>(jvm: &mut Jvm<'jvm>) -> Result<'jvm, ()> {
+    let raw = jvm.as_raw();
+    let thrown = unsafe { (**raw).ExceptionOccurred.unwrap()(raw) };
+    if thrown.is_null() {
+        Ok(())
+    } else {
+        // XX: SAFETY: not null, wrap before making further calls to ensure we drop the ref
+        let thrown =
+            unsafe { Local::from_jni(AutoLocal::new(JObject::from_raw(thrown), jvm.to_env())) };
+
+        unsafe {
+            (**raw).ExceptionClear.unwrap()(raw);
+        }
+
+        Err(Error::Thrown(thrown))
+    }
+}
+
 /// Plumbing utility to wrap an operation using the [`jni`] crate [`JNIEnv`] that will check for, and materialize,
 /// thrown exceptions. This should be the default way to convert [`jni::errors::Result`]s into Duchess [`Result`]s in
 /// generated code.
@@ -86,17 +115,8 @@ pub fn with_jni_env<'jvm, T>(
     let result = f(env);
     result.map_err(|e| match e {
         jni::errors::Error::JavaException => {
-            let exception = match env.exception_occurred() {
-                Ok(ex) => ex,
-                Err(e) => return convert_non_throw_jni_error(e),
-            };
-            assert!(!exception.is_null());
-            if let Err(e) = env.exception_clear() {
-                return convert_non_throw_jni_error(e);
-            }
-            Error::Thrown(unsafe {
-                Local::from_jni(AutoLocal::new(JObject::from(exception), &env))
-            })
+            todo!()
+            // check_exception(env).unwrap_err()
         }
         error => convert_non_throw_jni_error(error),
     })
