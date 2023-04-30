@@ -27,6 +27,7 @@ pub use prelude::*;
 pub mod codegen_deps {
     pub use jni;
     pub use once_cell;
+    pub use jni_sys;
 }
 
 pub mod prelude {
@@ -42,6 +43,6 @@ pub mod prelude {
 /// names used by generated code.
 pub mod plumbing {
     pub use crate::cast::Upcast;
-    pub use crate::error::{convert_non_throw_jni_error, with_jni_env};
+    pub use crate::error::{convert_non_throw_jni_error, with_jni_env, check_exception};
     pub use crate::jvm::{FromJValue, JavaObjectExt};
 }

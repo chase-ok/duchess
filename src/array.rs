@@ -1,4 +1,5 @@
 use std::marker::PhantomData;
+use std::ptr::NonNull;
 
 use crate::{
     cast::Upcast,
@@ -8,7 +9,6 @@ use crate::{
     plumbing::JavaObjectExt,
     Error, IntoRust, IntoScalar, JavaObject, JavaType, Jvm, JvmOp, Local, ScalarMethod,
 };
-use jni::objects::{AutoLocal, JObject};
 
 pub struct JavaArray<T: JavaType> {
     _element: PhantomData<T>,
@@ -71,7 +71,7 @@ where
 
         let raw = jvm.as_raw();
         // XX: safety: not null?
-        let len = unsafe { (**raw).GetArrayLength.unwrap()(raw, this) };
+        let len = unsafe { (**raw).GetArrayLength.unwrap()(raw, this.as_ptr()) };
         Ok(len)
     }
 }
@@ -86,34 +86,29 @@ macro_rules! primivite_array {
                     let Ok(len) = self.len().try_into() else {
                         return Err(Error::SliceTooLong(self.len()))
                     };
-            
-                    let raw = jvm.as_raw();
-                    let array = unsafe { (**raw).$new_fn.unwrap()(raw, len) };
-                    if array.is_null() {
+
+                    let jni = jvm.as_raw();
+                    let array = unsafe { (**jni).$new_fn.unwrap()(jni, len) };
+                    if let Some(array) = NonNull::new(array) {
+                        // XX: safety
+                        unsafe {
+                            (**jni).$set_fn.unwrap()(
+                                jni,
+                                array.as_ptr(),
+                                0,
+                                len,
+                                self.as_ptr().cast::<jni_sys::$java_ty>(),
+                            );
+                        }
+
+                        unsafe { Ok(Local::from_raw(jni, array)) }
+                    } else {
                         check_exception(jvm)?; // Likely threw OutOfMemoryError
                         return Err(Error::JvmInternal(format!(
                             "failed to allocate `{}[{}]`",
                             $java_name,
                             len
                         )));
-                    }
-            
-                    // XX: safety
-                    unsafe {
-                        (**raw).$set_fn.unwrap()(
-                            raw,
-                            array,
-                            0,
-                            len,
-                            self.as_ptr().cast::<jni_sys::$java_ty>(),
-                        );
-                    }
-            
-                    unsafe {
-                        Ok(Local::from_jni(AutoLocal::new(
-                            JObject::from_raw(array),
-                            jvm.to_env(),
-                        )))
                     }
                 }
             }
@@ -130,12 +125,12 @@ macro_rules! primivite_array {
 
                     let len = array.length().execute(jvm)?;
                     let mut vec = Vec::<$rust>::with_capacity(len as usize);
-            
+
                     let raw = jvm.as_raw();
                     unsafe {
                         (**raw).$get_fn.unwrap()(
                             raw,
-                            array.as_raw(),
+                            array.as_raw().as_ptr(),
                             0,
                             len,
                             vec.as_mut_ptr().cast::<jni_sys::$java_ty>(),
@@ -143,7 +138,7 @@ macro_rules! primivite_array {
                         vec.set_len(len as usize);
                     }
                     check_exception(jvm)?;
-            
+
                     Ok(vec)
                 }
             }

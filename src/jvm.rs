@@ -1,15 +1,17 @@
 use crate::{
     cast::{AsUpcast, TryDowncast, Upcast},
     catch::{CatchNone, Catching},
+    error::check_exception,
     inspect::{ArgOp, Inspect},
     java::lang::{Class, ClassExt, Throwable},
     not_null::NotNull,
-    plumbing::{convert_non_throw_jni_error, with_jni_env},
-    IntoLocal,
+    plumbing::{convert_non_throw_jni_error},
+    Error, IntoLocal,
 };
 
 use std::{
     env,
+    ffi::CStr,
     marker::PhantomData,
     ops::{Deref, DerefMut},
     ptr::NonNull,
@@ -158,13 +160,13 @@ impl<'jvm> Jvm<'jvm> {
     where
         R: JavaObject,
     {
-        let env = self.to_env();
+        let jni = self.as_raw();
+        let obj = r.as_raw();
+        // XX: safety of lifetime
         unsafe {
-            let raw = r.as_jobject();
-            assert!(!raw.is_null());
-            let new_local_ref = env.new_local_ref(&*raw).unwrap();
-            assert!(!new_local_ref.is_null());
-            Local::from_jni(AutoLocal::new(new_local_ref, &env))
+            let new_ref = (**jni).NewLocalRef.unwrap()(jni, obj.as_ptr());
+            // XX: new_ref may be nul if we ran out of memory
+            Local::from_raw(jni, NonNull::new(new_ref).unwrap())
         }
     }
 
@@ -172,13 +174,12 @@ impl<'jvm> Jvm<'jvm> {
     where
         R: JavaObject,
     {
-        let env = self.to_env();
+        let jni = self.as_raw();
+        let obj = r.as_raw();
         unsafe {
-            let raw = r.as_jobject();
-            assert!(!raw.is_null());
-            let new_global_ref = env.new_global_ref(&*raw).unwrap();
-            assert!(!new_global_ref.is_null());
-            Global::from_jni(new_global_ref)
+            let new_ref = (**jni).NewGlobalRef.unwrap()(jni, obj.as_ptr());
+            // XX: new_ref may be nul if we ran out of memory
+            Global::from_raw(NonNull::new(new_ref).unwrap())
         }
     }
 }
@@ -216,12 +217,25 @@ pub trait JavaObjectExt: Sized {
     // We use an extension trait, instead of just declaring these functions on the main JavaObject
     // trait, to prevent trait implementors from overriding the implementation of these functions.
 
-    fn from_jobject<'a>(obj: &'a JObject<'a>) -> Option<&'a Self>;
     fn as_jobject(&self) -> BorrowedJObject<'_>;
-    fn as_raw(&self) -> jni_sys::jobject;
+
+    unsafe fn from_raw<'a>(ptr: NonNull<jni_sys::_jobject>) -> &'a Self;
+    fn as_raw(&self) -> NonNull<jni_sys::_jobject>;
 }
 impl<T: JavaObject> JavaObjectExt for T {
-    fn from_jobject<'a>(obj: &'a JObject<'a>) -> Option<&'a Self> {
+    fn as_jobject(&self) -> BorrowedJObject<'_> {
+        let raw = self.as_raw();
+
+        // SAFETY: the only way to get a `&Self` is by calling `Self::from_jobject` (trait rule #1),
+        // so reconstructing the original JObject passed to `from_jni` should also be safe.
+        let obj = unsafe { JObject::from_raw(raw.as_ptr()) };
+
+        // We must wrap the JObject to prevent anyone from calling `delete_local_ref` on it;
+        // otherwise, `self` could become dangling
+        BorrowedJObject::new(obj)
+    }
+
+    unsafe fn from_raw<'a>(ptr: NonNull<jni_sys::_jobject>) -> &'a Self {
         // SAFETY: I *think* the cast is sound, because:
         //
         // 1. A pointer to a suitably aligned `sys::_jobject` should also satisfy Self's alignment
@@ -232,23 +246,14 @@ impl<T: JavaObject> JavaObjectExt for T {
         //    subject to the aliasing rules.
         //
         // XXX: Please check my homework.
-        Some(unsafe { NonNull::new(obj.as_raw())?.cast().as_ref() })
+        unsafe { ptr.cast().as_ref() }
     }
 
-    fn as_jobject(&self) -> BorrowedJObject<'_> {
-        let raw = self.as_raw();
-
-        // SAFETY: the only way to get a `&Self` is by calling `Self::from_jobject` (trait rule #1),
-        // so reconstructing the original JObject passed to `from_jni` should also be safe.
-        let obj = unsafe { JObject::from_raw(raw) };
-
-        // We must wrap the JObject to prevent anyone from calling `delete_local_ref` on it;
-        // otherwise, `self` could become dangling
-        BorrowedJObject::new(obj)
-    }
-
-    fn as_raw(&self) -> jni_sys::jobject {
-        (self as *const Self).cast_mut().cast::<jni_sys::_jobject>()
+    fn as_raw(&self) -> NonNull<jni_sys::_jobject> {
+        // XX: safety
+        unsafe {
+            NonNull::new_unchecked((self as *const Self).cast_mut()).cast::<jni_sys::_jobject>()
+        }
     }
 }
 
@@ -271,13 +276,21 @@ macro_rules! scalar {
         $(
             unsafe impl JavaType for $rust {
                 fn array_class<'jvm>(jvm: &mut Jvm<'jvm>) -> crate::Result<'jvm, Local<'jvm, Class>> {
-                    let env = jvm.to_env();
+                    let jni = jvm.as_raw();
 
+                    // XX: Safety
+                    const CLASS_NAME: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked($array_class) };
                     static CLASS: OnceCell<Global<crate::java::lang::Class>> = OnceCell::new();
+
                     let global = CLASS.get_or_try_init::<_, crate::Error<Local<Throwable>>>(|| {
-                        let class = with_jni_env(env, |env| env.find_class($array_class))?;
-                        let global = with_jni_env(env, |env| env.new_global_ref(class))?;
-                        Ok(unsafe { Global::from_jni(global) })
+                        // XX: safety
+                        let class = unsafe { (**jni).FindClass.unwrap()(jni, CLASS_NAME.as_ptr()) };
+                        if let Some(class) = NonNull::new(class) {
+                            Ok(jvm.global(unsafe { &Local::from_raw(jni, class) }))
+                        } else {
+                            check_exception(jvm)?;
+                            Err(Error::JvmInternal(format!("failed to load array class `{}`", CLASS_NAME.to_string_lossy())))
+                        }
                     })?;
                     Ok(jvm.local(global))
                 }
@@ -289,14 +302,14 @@ macro_rules! scalar {
 }
 
 scalar! {
-    bool: "[Z",
-    i8:   "[B",
-    i16:  "[S",
-    u16:  "[C",
-    i32:  "[I",
-    i64:  "[J",
-    f32:  "[F",
-    f64:  "[D",
+    bool: b"[Z\0",
+    i8:   b"[B\0",
+    i16:  b"[S\0",
+    u16:  b"[C\0",
+    i32:  b"[I\0",
+    i64:  b"[J\0",
+    f32:  b"[F\0",
+    f64:  b"[D\0",
 }
 
 /// A wrapper for a [JObject] that only allows access by reference. This prevents passing the
@@ -334,78 +347,100 @@ impl<T> AsMut<T> for Jail<T> {
     }
 }
 
-// I suspect we'll need to change these from type aliases to newtypes, for ergonomics sake, but for
-// now, they just work.
-
 /// An owned local reference to a non-null Java object of type `T`. The reference will be freed when
 /// dropped.
-pub type Local<'a, T> = OwnedRef<'a, AutoLocal<'a, JObject<'a>>, T>;
+pub struct Local<'a, T: JavaObject> {
+    ptr: NonNull<jni_sys::_jobject>,
+    jni: *mut jni_sys::JNIEnv,
+    _marker: PhantomData<&'a T>,
+}
+
+// XX: safety
+unsafe impl<T: JavaObject> Send for Local<'_, T> {}
+// XX: safety
+unsafe impl<T: JavaObject> Sync for Local<'_, T> {}
+
+impl<T: JavaObject> Drop for Local<'_, T> {
+    fn drop(&mut self) {
+        let jni = self.jni;
+        // XX safety
+        unsafe { (**jni).DeleteLocalRef.unwrap()(jni, self.ptr.as_ptr()) }
+    }
+}
+
+impl<T: JavaObject> Deref for Local<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        // XX: safety
+        unsafe { T::from_raw(self.ptr) }
+    }
+}
+
+impl<'a, T: JavaObject> Local<'a, T> {
+    pub unsafe fn from_raw(jni: *mut jni_sys::JNIEnv, ptr: NonNull<jni_sys::_jobject>) -> Self {
+        Self {
+            ptr,
+            jni,
+            _marker: PhantomData,
+        }
+    }
+
+    pub unsafe fn from_jni(_inner: AutoLocal<'a, JObject<'a>>) -> Self {
+        todo!()
+    }
+}
 
 /// An owned global reference to a non-null Java object of type `T`. The reference will be freed
 /// when dropped.
-pub type Global<T> = OwnedRef<'static, GlobalRef, T>;
-
-/// An *owned* JNI reference, either local or global, to a non-null Java object of type `T`. The
-/// underlying JNI reference is represented by type `J`, which is responsible for freeing the
-/// reference when dropped.
-///
-/// Typically, instead of using `OwnedRef` directly, you would use one of the type aliases, [Local]
-/// or [Global]. If you need a borrowed reference instead of an owned one, just use `&T`.
-#[repr(transparent)]
-pub struct OwnedRef<'a, J, T> {
-    inner: J,
-    phantom: PhantomData<&'a T>,
+/// XX: not wrapped in Arc like jni
+pub struct Global<T: JavaObject> {
+    ptr: NonNull<jni_sys::_jobject>,
+    _marker: PhantomData<T>,
 }
 
-impl<J, T> OwnedRef<'_, J, T> {
-    /// Converts an underlying JNI reference into an [OwnedRef].
-    ///
-    /// # Safety
-    ///
-    /// `inner` must refer to a non-null Java object whose type is `T`.
-    pub unsafe fn from_jni(inner: J) -> Self {
-        Self {
-            inner,
-            phantom: PhantomData,
+// XX: safety
+unsafe impl<T: JavaObject> Send for Global<T> {}
+// XX: safety
+unsafe impl<T: JavaObject> Sync for Global<T> {}
+
+impl<T: JavaObject> Drop for Global<T> {
+    fn drop(&mut self) {
+        let result = Jvm::with(|jvm| {
+            let raw = jvm.as_raw();
+            // XX: safety
+            unsafe {
+                (**raw).DeleteGlobalRef.unwrap()(raw, self.ptr.as_ptr());
+            }
+            Ok(())
+        });
+        if let Err(_e) = result {
+            // XX debug log
         }
     }
 }
 
-impl<'a, J, T> Deref for OwnedRef<'a, J, T>
-where
-    J: Deref<Target = JObject<'a>>,
-    T: JavaObject,
-{
+impl<T: JavaObject> Deref for Global<T> {
     type Target = T;
+
     fn deref(&self) -> &Self::Target {
-        T::from_jobject(&*self.inner).expect("inner reference is null")
+        // XX: safety
+        unsafe { T::from_raw(self.ptr) }
     }
 }
 
-// pub(crate) trait IntoRawJObject {
-//     fn into_raw(self) -> sys::jobject;
-// }
+impl<T: JavaObject> Global<T> {
+    unsafe fn from_raw(ptr: NonNull<jni_sys::_jobject>) -> Self {
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
 
-// impl IntoRawJObject for JObject<'_> {
-//     fn into_raw(self) -> sys::jobject {
-//         self.into_raw()
-//     }
-// }
-
-// impl IntoRawJObject for sys::jobject {
-//     fn into_raw(self) -> sys::jobject {
-//         self
-//     }
-// }
-
-// impl<R> IntoRawJObject for &R
-// where
-//     R: JavaObject,
-// {
-//     fn into_raw(self) -> sys::jobject {
-//         self.to_raw()
-//     }
-// }
+    pub unsafe fn from_jni(inner: GlobalRef) -> Self {
+        Self::from_raw(NonNull::new(inner.as_raw()).unwrap())
+    }
+}
 
 impl<'a, R, S> AsRef<S> for Local<'a, R>
 where
@@ -413,21 +448,20 @@ where
     S: JavaObject + 'a,
 {
     fn as_ref(&self) -> &S {
-        // XX: Safety: repr(transparent) so OwnedRef<J, X> and OwnedRef<J, Y> have the same repr
-        let upcast: &Local<'a, S> = unsafe { std::mem::transmute(self) };
-        upcast
+        // XX: Safety
+        unsafe { S::from_raw(self.ptr) }
     }
 }
 
-impl<'a, R> Local<'a, R> {
+impl<'a, R: JavaObject> Local<'a, R> {
     /// XX: Trying to map onto Into causes impl conflits
     pub fn upcast<S>(self) -> Local<'a, S>
     where
         R: Upcast<S>,
         S: JavaObject + 'a,
     {
-        // XX: Safety: repr(transparent) so OwnedRef<J, X> and OwnedRef<J, Y> have the same repr
-        let upcast: Local<'a, S> = unsafe { std::mem::transmute(self) };
+        // XX: safety
+        let upcast = unsafe { Local::<S>::from_raw(self.jni, self.ptr) };
         upcast
     }
 }
@@ -438,21 +472,20 @@ where
     S: JavaObject + 'static,
 {
     fn as_ref(&self) -> &S {
-        // XX: Safety: repr(transparent) so OwnedRef<J, X> and OwnedRef<J, Y> have the same repr
-        let upcast: &Global<S> = unsafe { std::mem::transmute(self) };
-        upcast
+        // XX: Safety
+        unsafe { S::from_raw(self.ptr) }
     }
 }
 
-impl<R> Global<R> {
+impl<R: JavaObject> Global<R> {
     /// XX: Trying to map onto Into causes impl conflits
     pub fn upcast<S>(self) -> Global<S>
     where
         R: Upcast<S>,
         S: JavaObject + 'static,
     {
-        // XX: Safety: repr(transparent) so OwnedRef<J, X> and OwnedRef<J, Y> have the same repr
-        let upcast: Global<S> = unsafe { std::mem::transmute(self) };
+        // XX: safety
+        let upcast = unsafe { Global::<S>::from_raw(self.ptr) };
         upcast
     }
 }

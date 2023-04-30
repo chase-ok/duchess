@@ -238,18 +238,27 @@ impl ClassInfo {
     }
 
     fn cached_class(&self) -> TokenStream {
-        let jni_class_name = self.jni_class_name();
+        let jni_class_name = self.jni_class_name_c_str();
 
         quote_spanned! {
             self.span =>
             fn class<'jvm>(jvm: &mut Jvm<'jvm>) -> duchess::Result<'jvm, Local<'jvm, java::lang::Class>> {
-                let env = jvm.to_env();
-
+                let jni = jvm.as_raw();
+                
+                // XX: Safety
+                const CLASS_NAME: &::std::ffi::CStr = unsafe { 
+                    ::std::ffi::CStr::from_bytes_with_nul_unchecked(#jni_class_name) 
+                };
                 static CLASS: OnceCell<Global<java::lang::Class>> = OnceCell::new();
                 let global = CLASS.get_or_try_init::<_, duchess::Error<Local<java::lang::Throwable>>>(|| {
-                    let class = with_jni_env(env, |env| env.find_class(#jni_class_name))?;
-                    let global = with_jni_env(env, |env| env.new_global_ref(class))?;
-                    Ok(unsafe { Global::from_jni(global) })
+                    let class = unsafe { (**jni).FindClass.unwrap()(jni, CLASS_NAME.as_ptr()) };
+                    if let Some(class) = ::std::ptr::NonNull::new(class) {
+                        // XX: safety
+                        Ok(jvm.global(unsafe { &Local::from_raw(jni, class) }))
+                    } else {
+                        check_exception(jvm)?;
+                        Err(duchess::Error::JvmInternal(format!("failed to class `{}`", CLASS_NAME.to_string_lossy())))
+                    }
                 })?;
                 Ok(jvm.local(global))
             }
@@ -321,10 +330,9 @@ impl ClassInfo {
                             #(#prepare_inputs)*
 
                             let class = <#ty>::class(jvm)?;
-                            let class = class.as_jobject();
-                            let class: &JClass = (&*class).into();
+                            let class = class.as_raw();
 
-                            let env = jvm.to_env();
+                            let jni = jvm.as_raw();
 
                             // Cache the method id for the constructor -- note that we only have one cache
                             // no matter how many generic monomorphizations there are. This makes sense
@@ -559,9 +567,9 @@ impl ClassInfo {
         }
     }
 
-    /// Returns a class name with `/`, like `java/lang/Object`.
-    fn jni_class_name(&self) -> Literal {
-        self.name.to_jni_name(self.span)
+    /// Returns a class name with `/`, like `java/lang/Object` as a nul-terminated `[u8]`
+    fn jni_class_name_c_str(&self) -> Literal {
+        self.name.to_jni_name_c_str(self.span)
     }
 
     fn prepare_inputs(&self, input_names: &[Ident], input_types: &[Type]) -> Vec<TokenStream> {
@@ -831,20 +839,22 @@ impl Signature {
 }
 
 trait DotIdExt {
-    fn to_jni_name(&self, span: Span) -> Literal;
+    fn to_jni_name_c_str(&self, span: Span) -> Literal;
     fn to_module_name(&self, span: Span) -> TokenStream;
 }
 
 impl DotIdExt for DotId {
-    fn to_jni_name(&self, _span: Span) -> Literal {
+    fn to_jni_name_c_str(&self, _span: Span) -> Literal {
         let (package_names, struct_name) = self.split();
-        let mut output = String::new();
+        let mut output = Vec::<u8>::new();
         for p in package_names {
-            output.push_str(p);
-            output.push_str("/");
+            output.extend(p.as_bytes());
+            output.push(b'/');
         }
-        output.push_str(struct_name);
-        Literal::string(&output)
+        output.extend(struct_name.as_bytes());
+        assert!(!output.contains(&0), "JNI name shouldn't contain internal nul bytes");
+        output.push(0);
+        Literal::byte_string(&output)
     }
 
     fn to_module_name(&self, span: Span) -> TokenStream {
