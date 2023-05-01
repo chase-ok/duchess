@@ -4,10 +4,12 @@ mod array;
 mod cast;
 mod catch;
 mod error;
+mod find;
 mod inspect;
 mod jvm;
 mod not_null;
 mod ops;
+mod raw;
 mod str;
 
 /// Contains reusable declarations for classes distributed by the JDK under the `java.*` packages.
@@ -26,8 +28,8 @@ pub use prelude::*;
 /// Re-export the dependencies that are used by the generated code.
 pub mod codegen_deps {
     pub use jni;
-    pub use once_cell;
     pub use jni_sys;
+    pub use once_cell;
 }
 
 pub mod prelude {
@@ -43,6 +45,8 @@ pub mod prelude {
 /// names used by generated code.
 pub mod plumbing {
     pub use crate::cast::Upcast;
-    pub use crate::error::{convert_non_throw_jni_error, with_jni_env, check_exception};
-    pub use crate::jvm::{FromJValue, JavaObjectExt};
+    pub use crate::error::{check_exception, convert_non_throw_jni_error, with_jni_env};
+    pub use crate::find::{find_class, find_method, find_constructor};
+    pub use crate::raw::{IntoJniValue, FromJniValue, MethodPtr, ObjectPtr};
+    pub use crate::jvm::JavaObjectExt;
 }

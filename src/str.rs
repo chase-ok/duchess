@@ -1,12 +1,11 @@
-use std::{ffi::CString, ptr::NonNull};
-
-use jni::objects::{AutoLocal, JObject};
+use std::ffi::CString;
 
 use crate::{
     error::check_exception,
     java::lang::String as JavaString,
     jvm::JavaObjectExt,
     ops::{IntoJava, IntoRust},
+    raw::ObjectPtr,
     Error, Jvm, JvmOp, Local,
 };
 
@@ -19,8 +18,8 @@ impl IntoJava<JavaString> for &str {
         let c_string = unsafe { CString::from_vec_unchecked(encoded.into_owned()) };
 
         let jni = jvm.as_raw();
-        let string = unsafe { (**jni).NewStringUTF.unwrap()(jni, c_string.as_ptr()) };
-        if let Some(string) = NonNull::new(string) {
+        let string = unsafe { jni.invoke(|jni| jni.NewStringUTF, |jni, f| f(jni, c_string.as_ptr())) };
+        if let Some(string) = ObjectPtr::new(string) {
             Ok(unsafe { Local::from_raw(jni, string) })
         } else {
             check_exception(jvm)?; // likely threw an OutOfMemoryError
@@ -46,23 +45,23 @@ where
         let object = self.execute_with(jvm, ())?;
         let str_raw = object.as_ref().as_raw();
 
-        let raw = jvm.as_raw();
+        let jni = jvm.as_raw();
 
-        let cesu8_len = unsafe { (**raw).GetStringUTFLength.unwrap()(raw, str_raw.as_ptr()) };
+        let cesu8_len = unsafe { jni.invoke(|jni| jni.GetStringUTFLength, |jni, f| f(jni, str_raw.as_ptr())) };
         assert!(cesu8_len >= 0);
-        let utf16_len = unsafe { (**raw).GetStringLength.unwrap()(raw, str_raw.as_ptr()) };
+        let utf16_len = unsafe { jni.invoke(|jni| jni.GetStringLength, |jni, f| f(jni, str_raw.as_ptr())) };
         assert!(utf16_len >= 0);
 
         let mut cesu_bytes = Vec::<u8>::with_capacity(cesu8_len as usize);
         // XX: safety
         unsafe {
-            (**raw).GetStringUTFRegion.unwrap()(
-                raw,
+            jni.invoke(|jni| jni.GetStringUTFRegion, |jni, f| f(
+                jni,
                 str_raw.as_ptr(),
                 0,
                 utf16_len,
                 cesu_bytes.as_mut_ptr().cast::<i8>(),
-            );
+            ));
             cesu_bytes.set_len(cesu8_len as usize);
         };
         check_exception(jvm)?;

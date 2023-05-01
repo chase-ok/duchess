@@ -1,11 +1,11 @@
 use std::marker::PhantomData;
-use std::ptr::NonNull;
 
 use crate::{
     cast::Upcast,
     error::check_exception,
     java::{self, lang::Class},
     ops::IntoJava,
+    raw::ObjectPtr,
     plumbing::JavaObjectExt,
     Error, IntoRust, IntoScalar, JavaObject, JavaType, Jvm, JvmOp, Local, ScalarMethod,
 };
@@ -69,9 +69,8 @@ where
         let this = self.this.execute_with(jvm, input)?;
         let this = this.as_ref().as_raw();
 
-        let raw = jvm.as_raw();
         // XX: safety: not null?
-        let len = unsafe { (**raw).GetArrayLength.unwrap()(raw, this.as_ptr()) };
+        let len = unsafe { jvm.as_raw().invoke(|jni| jni.GetArrayLength, |jni, f| f(jni, this.as_ptr())) };
         Ok(len)
     }
 }
@@ -88,17 +87,17 @@ macro_rules! primivite_array {
                     };
 
                     let jni = jvm.as_raw();
-                    let array = unsafe { (**jni).$new_fn.unwrap()(jni, len) };
-                    if let Some(array) = NonNull::new(array) {
+                    let array = unsafe { jni.invoke(|jni| jni.$new_fn, |jni, f| f(jni, len)) };
+                    if let Some(array) = ObjectPtr::new(array) {
                         // XX: safety
                         unsafe {
-                            (**jni).$set_fn.unwrap()(
+                            jni.invoke(|jni| jni.$set_fn, |jni, f| f(
                                 jni,
                                 array.as_ptr(),
                                 0,
                                 len,
                                 self.as_ptr().cast::<jni_sys::$java_ty>(),
-                            );
+                            ));
                         }
 
                         unsafe { Ok(Local::from_raw(jni, array)) }
@@ -126,15 +125,15 @@ macro_rules! primivite_array {
                     let len = array.length().execute(jvm)?;
                     let mut vec = Vec::<$rust>::with_capacity(len as usize);
 
-                    let raw = jvm.as_raw();
                     unsafe {
-                        (**raw).$get_fn.unwrap()(
-                            raw,
+                        // XX: safety
+                        jvm.as_raw().invoke(|jni| jni.$get_fn, |jni, f| f(
+                            jni,
                             array.as_raw().as_ptr(),
                             0,
                             len,
                             vec.as_mut_ptr().cast::<jni_sys::$java_ty>(),
-                        );
+                        ));
                         vec.set_len(len as usize);
                     }
                     check_exception(jvm)?;

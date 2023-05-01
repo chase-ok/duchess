@@ -74,12 +74,14 @@ where
 
         let jni = jvm.as_raw();
         let is_inst = unsafe {
-            (**jni).IsInstanceOf.unwrap()(jni, instance_raw.as_ptr(), class_raw.as_ptr()) == jni_sys::JNI_TRUE
+            jni.invoke(|jni| jni.IsInstanceOf, |jni, f| f(jni, instance_raw.as_ptr(), class_raw.as_ptr()))
+                == jni_sys::JNI_TRUE
         };
 
         if is_inst {
-            // Safety: just shown that jobject instanceof To::class
-            Ok(Ok(jvm.local(unsafe { std::mem::transmute::<&From, &To>(instance.as_ref()) })))
+            // XX: Safety: just shown that jobject instanceof To::class
+            let casted = unsafe { std::mem::transmute::<&From, &To>(instance.as_ref()) };
+            Ok(Ok(jvm.local(casted)))
         } else {
             Ok(Err(instance))
         }
@@ -140,16 +142,14 @@ where
         let instance = self.op.execute_with(jvm, input)?;
 
         if cfg!(debug_assertions) {
-            let to_class = To::class(jvm)?;
-            let to_class_raw = to_class.as_raw();
+            let class = To::class(jvm)?;
+            let class_raw = class.as_raw();
 
             let instance_raw = instance.as_ref().as_raw();
-            let raw = jvm.as_raw();
-            assert!(
-                unsafe {
-                    (**raw).IsInstanceOf.unwrap()(raw, instance_raw.as_ptr(), to_class_raw.as_ptr()) == jni_sys::JNI_TRUE
-                }
-            );
+            assert!(unsafe {
+                jvm.as_raw().invoke(|jni| jni.IsInstanceOf, |jni, f| f(jni, instance_raw.as_ptr(), class_raw.as_ptr()))
+                    == jni_sys::JNI_TRUE
+            });
         }
 
         // Safety: From: Upcast<To>

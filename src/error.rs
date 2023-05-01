@@ -3,13 +3,10 @@ use std::{
     result,
 };
 
-use jni::{
-    objects::{AutoLocal, JObject},
-    JNIEnv,
-};
+use jni::JNIEnv;
 use thiserror::Error;
 
-use crate::{java::lang::Throwable, Global, Jvm, Local};
+use crate::{java::lang::Throwable, Global, Jvm, Local, raw::ObjectPtr};
 
 /// Result returned by most Java operations that may contain a local reference
 /// to a thrown exception.
@@ -80,20 +77,13 @@ impl<T> From<jni::errors::JniError> for Error<T> {
 }
 
 pub fn check_exception<'jvm>(jvm: &mut Jvm<'jvm>) -> Result<'jvm, ()> {
-    let raw = jvm.as_raw();
-    let thrown = unsafe { (**raw).ExceptionOccurred.unwrap()(raw) };
-    if thrown.is_null() {
-        Ok(())
+    let jni = jvm.as_raw();
+    let thrown = unsafe { jni.invoke(|jni| jni.ExceptionOccurred, |jni, f| f(jni)) };
+    if let Some(thrown) = ObjectPtr::new(thrown) {
+        unsafe { jni.invoke(|jni| jni.ExceptionClear, |jni, f| f(jni)) };
+        Err(Error::Thrown(unsafe { Local::from_raw(jni, thrown) }))
     } else {
-        // XX: SAFETY: not null, wrap before making further calls to ensure we drop the ref
-        let thrown =
-            unsafe { Local::from_jni(AutoLocal::new(JObject::from_raw(thrown), jvm.to_env())) };
-
-        unsafe {
-            (**raw).ExceptionClear.unwrap()(raw);
-        }
-
-        Err(Error::Thrown(thrown))
+        Ok(())
     }
 }
 
