@@ -5,8 +5,8 @@ use crate::{
     error::check_exception,
     java::{self, lang::Class},
     ops::IntoJava,
-    raw::ObjectPtr,
     plumbing::JavaObjectExt,
+    raw::{HasEnvPtr, ObjectPtr},
     Error, IntoRust, IntoScalar, JavaObject, JavaType, Jvm, JvmOp, Local, ScalarMethod,
 };
 
@@ -70,7 +70,10 @@ where
         let this = this.as_ref().as_raw();
 
         // XX: safety: not null?
-        let len = unsafe { jvm.as_raw().invoke(|jni| jni.GetArrayLength, |jni, f| f(jni, this.as_ptr())) };
+        let len = unsafe {
+            jvm.env()
+                .invoke(|env| env.GetArrayLength, |env, f| f(env, this.as_ptr()))
+        };
         Ok(len)
     }
 }
@@ -86,13 +89,13 @@ macro_rules! primivite_array {
                         return Err(Error::SliceTooLong(self.len()))
                     };
 
-                    let jni = jvm.as_raw();
-                    let array = unsafe { jni.invoke(|jni| jni.$new_fn, |jni, f| f(jni, len)) };
+                    let env = jvm.env();
+                    let array = unsafe { env.invoke(|env| env.$new_fn, |env, f| f(env, len)) };
                     if let Some(array) = ObjectPtr::new(array) {
                         // XX: safety
                         unsafe {
-                            jni.invoke(|jni| jni.$set_fn, |jni, f| f(
-                                jni,
+                            env.invoke(|env| env.$set_fn, |env, f| f(
+                                env,
                                 array.as_ptr(),
                                 0,
                                 len,
@@ -100,7 +103,7 @@ macro_rules! primivite_array {
                             ));
                         }
 
-                        unsafe { Ok(Local::from_raw(jni, array)) }
+                        unsafe { Ok(Local::from_raw(env, array)) }
                     } else {
                         check_exception(jvm)?; // Likely threw OutOfMemoryError
                         return Err(Error::JvmInternal(format!(
@@ -127,8 +130,8 @@ macro_rules! primivite_array {
 
                     unsafe {
                         // XX: safety
-                        jvm.as_raw().invoke(|jni| jni.$get_fn, |jni, f| f(
-                            jni,
+                        jvm.env().invoke(|env| env.$get_fn, |env, f| f(
+                            env,
                             array.as_raw().as_ptr(),
                             0,
                             len,

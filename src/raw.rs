@@ -1,8 +1,188 @@
-use std::{marker::PhantomData, ptr::{NonNull, self}};
+use std::{
+    ffi,
+    marker::PhantomData,
+    ptr::{self, NonNull},
+};
 
 use jni_sys::jvalue;
 
-use crate::{JavaObject, jvm::JavaObjectExt, Jvm, Local};
+use crate::{jvm::JavaObjectExt, Error, GlobalResult, JavaObject, Jvm, Local};
+
+const VERSION: jni_sys::jint = jni_sys::JNI_VERSION_1_8;
+
+pub fn jvm() -> GlobalResult<Option<JvmPtr>> {
+    let libjvm = crate::libjvm::libjvm_or_load()?;
+
+    let mut jvms = [std::ptr::null_mut::<jni_sys::JavaVM>()];
+    let mut num_jvms: jni_sys::jsize = 0;
+
+    let code = unsafe {
+        (libjvm.JNI_GetCreatedJavaVMs)(
+            jvms.as_mut_ptr(),
+            jvms.len().try_into().unwrap(),
+            &mut num_jvms as *mut _,
+        )
+    };
+    if code != jni_sys::JNI_OK {
+        return Err(Error::JvmInternal(format!(
+            "GetCreatedJavaVMs failed with code `{code}`"
+        )));
+    }
+
+    match num_jvms {
+        0 => Ok(None),
+        1 => JvmPtr::new(jvms[0])
+            .ok_or_else(|| Error::JvmInternal("GetCreatedJavaVMs returned null pointer".into()))
+            .map(Some),
+        _ => Err(Error::JvmInternal(format!(
+            "GetCreatedJavaVMs returned more JVMs than expected: `{num_jvms}`"
+        ))),
+    }
+}
+
+pub fn create_jvm<'a>(options: impl IntoIterator<Item = &'a str>) -> GlobalResult<JvmPtr> {
+    let libjvm = crate::libjvm::libjvm_or_load()?;
+
+    let options = options
+        .into_iter()
+        .map(|opt| ffi::CString::new(opt).unwrap())
+        .collect::<Vec<_>>();
+
+    let mut option_ptrs = options
+        .iter()
+        .map(|opt| jni_sys::JavaVMOption {
+            optionString: opt.as_ptr().cast_mut(),
+            extraInfo: std::ptr::null_mut(),
+        })
+        .collect::<Vec<_>>();
+
+    let mut args = jni_sys::JavaVMInitArgs {
+        version: VERSION,
+        nOptions: options.len().try_into().unwrap(),
+        options: option_ptrs.as_mut_ptr(),
+        ignoreUnrecognized: jni_sys::JNI_FALSE,
+    };
+
+    let mut jvm = std::ptr::null_mut::<jni_sys::JavaVM>();
+    let mut env = std::ptr::null_mut::<ffi::c_void>();
+    let code = unsafe {
+        (libjvm.JNI_CreateJavaVM)(
+            &mut jvm as *mut _,
+            &mut env as *mut _,
+            &mut args as *mut _ as *mut ffi::c_void,
+        )
+    };
+
+    if code == jni_sys::JNI_OK {
+        JvmPtr::new(jvm)
+            .ok_or_else(|| Error::JvmInternal("CreateJavaVM returned null JVM pointer".into()))
+    } else {
+        Err(Error::JvmInternal(format!(
+            "CreateJavaVM failed with code `{code}`"
+        )))
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct JvmPtr(NonNull<jni_sys::JavaVM>);
+
+impl JvmPtr {
+    pub fn new(ptr: *mut jni_sys::JavaVM) -> Option<Self> {
+        NonNull::new(ptr).map(Self)
+    }
+
+    pub unsafe fn env<'jvm>(self) -> GlobalResult<Option<EnvPtr<'jvm>>> {
+        let mut env_ptr = std::ptr::null_mut::<ffi::c_void>();
+        match fn_table_call(
+            self.0,
+            |jvm| jvm.GetEnv,
+            |jvm, f| f(jvm, &mut env_ptr as *mut _, VERSION),
+        ) {
+            jni_sys::JNI_OK => Ok(Some(EnvPtr::new(env_ptr.cast()).unwrap())),
+            jni_sys::JNI_EDETACHED => Ok(None),
+            code => Err(Error::JvmInternal(format!(
+                "GetEnv failed with code `{code}`"
+            ))),
+        }
+    }
+
+    pub unsafe fn attach_thread<'jvm>(self) -> GlobalResult<EnvPtr<'jvm>> {
+        let mut env_ptr = std::ptr::null_mut::<ffi::c_void>();
+        match fn_table_call(
+            self.0,
+            |jvm| jvm.AttachCurrentThread,
+            |jvm, f| {
+                f(
+                    jvm,
+                    &mut env_ptr as *mut _,
+                    std::ptr::null_mut(), /* args */
+                )
+            },
+        ) {
+            jni_sys::JNI_OK => Ok(EnvPtr::new(env_ptr.cast()).unwrap()),
+            code => Err(Error::JvmInternal(format!(
+                "AttachCurrentThread failed with code `{code}`"
+            ))),
+        }
+    }
+
+    pub unsafe fn detach_thread(self) -> GlobalResult<()> {
+        match fn_table_call(self.0, |jvm| jvm.DetachCurrentThread, |jvm, f| f(jvm)) {
+            jni_sys::JNI_OK => Ok(()),
+            code => Err(Error::JvmInternal(format!(
+                "DetachCurrentThread failed with code `{code}`"
+            ))),
+        }
+    }
+}
+
+// XX
+unsafe fn fn_table_call<T, F, R>(
+    table_ptr: NonNull<*const T>,
+    fn_field: impl FnOnce(&T) -> Option<F>,
+    call: impl FnOnce(*mut *const T, F) -> R,
+) -> R {
+    let fn_field = fn_field(&**table_ptr.as_ptr());
+    let fn_field = fn_field.unwrap_unchecked();
+    call(table_ptr.as_ptr(), fn_field)
+}
+
+// XX safety
+unsafe impl Send for JvmPtr {}
+unsafe impl Sync for JvmPtr {}
+
+// XX: jvm lifetime
+#[derive(Clone, Copy)]
+pub struct EnvPtr<'jvm> {
+    ptr: NonNull<jni_sys::JNIEnv>,
+    _marker: PhantomData<&'jvm ()>,
+}
+
+impl<'jvm> EnvPtr<'jvm> {
+    pub unsafe fn new(ptr: *mut jni_sys::JNIEnv) -> Option<Self> {
+        let ptr = NonNull::new(ptr)?;
+        Some(Self {
+            ptr,
+            _marker: PhantomData,
+        })
+    }
+
+    pub unsafe fn invoke<F, T>(
+        self,
+        fn_field: impl FnOnce(&jni_sys::JNINativeInterface_) -> Option<F>,
+        call: impl FnOnce(*mut jni_sys::JNIEnv, F) -> T,
+    ) -> T {
+        fn_table_call(self.ptr, fn_field, call)
+    }
+}
+
+// XX EnvPtr isn't send/sync
+
+// XX: hiding behind this trait to avoid exposing through Jvm struct
+#[doc(hidden)]
+pub trait HasEnvPtr<'jvm> {
+    fn env(&self) -> EnvPtr<'jvm>;
+}
 
 #[derive(Clone, Copy)]
 pub struct ObjectPtr(NonNull<jni_sys::_jobject>);
@@ -41,35 +221,6 @@ impl From<NonNull<jni_sys::_jobject>> for ObjectPtr {
 unsafe impl Send for ObjectPtr {}
 unsafe impl Sync for ObjectPtr {}
 
-// XX: jvm lifetime
-#[derive(Clone, Copy)]
-pub struct JniPtr<'jvm> {
-    ptr: NonNull<jni_sys::JNIEnv>,
-    _marker: PhantomData<&'jvm ()>,
-}
-
-impl<'jvm> JniPtr<'jvm> {
-    pub unsafe fn new(ptr: *mut jni_sys::JNIEnv) -> Option<Self> {
-        let ptr = NonNull::new(ptr)?;
-        Some(Self {
-            ptr,
-            _marker: PhantomData,
-        })
-    }
-
-    pub unsafe fn invoke<F, T>(
-        self,
-        fn_field: impl FnOnce(&jni_sys::JNINativeInterface_) -> Option<F>,
-        call: impl FnOnce(*mut jni_sys::JNIEnv, F) -> T,
-    ) -> T {
-        let fn_field = fn_field(&**self.ptr.as_ptr());
-        let fn_field = unsafe { fn_field.unwrap_unchecked() }; // XX: JNI fn pointer shouldn't null
-        call(self.ptr.as_ptr(), fn_field)
-    }
-}
-
-// XX JniPtr isn't send/sync
-
 #[derive(Clone, Copy)]
 pub struct MethodPtr(NonNull<jni_sys::_jmethodID>);
 
@@ -87,6 +238,7 @@ impl MethodPtr {
 unsafe impl Send for MethodPtr {}
 unsafe impl Sync for MethodPtr {}
 
+/// XXX
 pub trait IntoJniValue {
     fn into_jni_value(self) -> jvalue;
 }
@@ -94,16 +246,15 @@ pub trait IntoJniValue {
 impl<T: JavaObject> IntoJniValue for &T {
     fn into_jni_value(self) -> jvalue {
         jvalue {
-            l: self.as_raw().as_ptr()
+            l: self.as_raw().as_ptr(),
         }
     }
 }
 
 impl<T: JavaObject> IntoJniValue for Option<&T> {
     fn into_jni_value(self) -> jvalue {
-        self.map(|v| v.into_jni_value()).unwrap_or(jvalue {
-            l: ptr::null_mut(),
-        })
+        self.map(|v| v.into_jni_value())
+            .unwrap_or(jvalue { l: ptr::null_mut() })
     }
 }
 
@@ -117,10 +268,11 @@ impl<'jvm, T: JavaObject> FromJniValue<'jvm> for Option<Local<'jvm, T>> {
 
     unsafe fn from_jni_value(jvm: &mut Jvm<'jvm>, value: Self::JniValue) -> Self {
         // XX safety
-        ObjectPtr::new(value).map(|obj| unsafe { Local::from_raw(jvm.as_raw(), obj)})
+        ObjectPtr::new(value).map(|obj| unsafe { Local::from_raw(jvm.env(), obj) })
     }
 }
 
+// () is Java `void`
 impl<'jvm> FromJniValue<'jvm> for () {
     type JniValue = ();
 

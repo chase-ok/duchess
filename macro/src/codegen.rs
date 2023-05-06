@@ -143,14 +143,7 @@ impl ClassInfo {
             const _: () = {
                 use duchess::{
                     *,
-                    codegen_deps::{
-                        once_cell::sync::OnceCell,
-                        jni::{
-                            objects::{AutoLocal, JMethodID, JClass, JValue, JValueGen},
-                            signature::{ReturnType, Primitive},
-                            sys::jvalue,
-                        },
-                    },
+                    codegen_deps::once_cell::sync::OnceCell,
                     plumbing::*,
                     prelude::*,
                 };
@@ -331,23 +324,23 @@ impl ClassInfo {
                                 find_constructor(jvm, &class, #jni_descriptor)
                             })?;
 
-                            let jni = jvm.as_raw();
-                            let obj = unsafe { 
-                                jni.invoke(|jni| jni.NewObjectA, |jni, f| f(
-                                    jni,
+                            let env = jvm.env();
+                            let obj = unsafe {
+                                env.invoke(|env| env.NewObjectA, |env, f| f(
+                                    env,
                                     class.as_raw().as_ptr(),
                                     constructor.as_ptr(),
                                     [
                                         #(#input_names.into_jni_value(),)*
                                     ].as_ptr(),
-                                )) 
+                                ))
                             };
 
                             if let Some(obj) = ObjectPtr::new(obj) {
-                                Ok(unsafe { Local::from_raw(jni, obj) })
+                                Ok(unsafe { Local::from_raw(env, obj) })
                             } else {
                                 check_exception(jvm)?;
-                                // NewObjectA should only return a null pointer when an exception occurred in the 
+                                // NewObjectA should only return a null pointer when an exception occurred in the
                                 // constructor, so reaching here is a strange JVM state
                                 Err(duchess::Error::JvmInternal(format!(
                                     "failed to create new `{}` via constructor `{}`",
@@ -516,8 +509,8 @@ impl ClassInfo {
                     })?;
 
                     let output = unsafe {
-                        jvm.as_raw().invoke(|jni| jni.#jni_call_fn, |jni, f| f(
-                            jni,
+                        jvm.env().invoke(|env| env.#jni_call_fn, |env, f| f(
+                            env,
                             this.as_ptr(),
                             method.as_ptr(),
                             [
@@ -733,25 +726,25 @@ impl Signature {
     fn jni_call_fn(&mut self, ty: &Option<Type>) -> Result<Ident, SpanError> {
         let f = match ty {
             Some(Type::Ref(_)) => "CallObjectMethodA",
-            Some(Type::Repeat(_)) => return Err(SpanError {
-                span: self.span,
-                message: format!(
-                    "unsupported repeating method return type in `{}`",
-                    self.method_name
-                ),
-            }),
-            Some(Type::Scalar(scalar)) => {
-                match scalar {
-                    ScalarType::Int => "CallIntMethodA",
-                    ScalarType::Long => "CallLongMethodA",
-                    ScalarType::Short => "CallShortMethodA",
-                    ScalarType::Byte => "CallByteMethodA",
-                    ScalarType::F64 => "CallDoubleMethodA",
-                    ScalarType::F32 => "CallFloatMethodA",
-                    ScalarType::Boolean => "CallBooleanMethodA",
-                    ScalarType::Char => "CallCharMethodA",
-                }
+            Some(Type::Repeat(_)) => {
+                return Err(SpanError {
+                    span: self.span,
+                    message: format!(
+                        "unsupported repeating method return type in `{}`",
+                        self.method_name
+                    ),
+                })
             }
+            Some(Type::Scalar(scalar)) => match scalar {
+                ScalarType::Int => "CallIntMethodA",
+                ScalarType::Long => "CallLongMethodA",
+                ScalarType::Short => "CallShortMethodA",
+                ScalarType::Byte => "CallByteMethodA",
+                ScalarType::F64 => "CallDoubleMethodA",
+                ScalarType::F32 => "CallFloatMethodA",
+                ScalarType::Boolean => "CallBooleanMethodA",
+                ScalarType::Char => "CallCharMethodA",
+            },
             None => "CallVoidMethodA",
         };
         Ok(Ident::new(f, self.span))
@@ -877,7 +870,7 @@ fn jni_c_str(contents: impl Into<String>, span: Span) -> TokenStream {
     let mut contents = contents.into().into_bytes();
     // \0 isn't valid UTF-8, so don't need to check that contents doesn't contain interior nul bytes.
     contents.push(0);
-    
+
     let byte_string = Literal::byte_string(&contents);
     quote_spanned!(span => unsafe { ::std::ffi::CStr::from_bytes_with_nul_unchecked(#byte_string) })
 }

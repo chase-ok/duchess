@@ -1,17 +1,23 @@
 use std::ffi::CStr;
 
-use crate::{java, plumbing::check_exception, raw::{ObjectPtr, MethodPtr}, Jvm, Local, Result, jvm::JavaObjectExt};
+use crate::{
+    java,
+    jvm::JavaObjectExt,
+    plumbing::{check_exception, HasEnvPtr},
+    raw::{MethodPtr, ObjectPtr},
+    Jvm, Local, Result,
+};
 
 pub fn find_class<'jvm>(
     jvm: &mut Jvm<'jvm>,
     jni_name: &CStr,
 ) -> Result<'jvm, Local<'jvm, java::lang::Class>> {
-    let jni = jvm.as_raw();
-    let class = unsafe { jni.invoke(|jni| jni.FindClass, |jni, f| f(jni, jni_name.as_ptr())) };
+    let env = jvm.env();
+    let class = unsafe { env.invoke(|env| env.FindClass, |env, f| f(env, jni_name.as_ptr())) };
     if let Some(class) = ObjectPtr::new(class) {
-        Ok(unsafe { Local::from_raw(jni, class) })
+        Ok(unsafe { Local::from_raw(env, class) })
     } else {
-        check_exception(jvm)?; 
+        check_exception(jvm)?;
         // Class not existing should've triggered NoClassDefFoundError so something strange is now happening
         Err(crate::Error::JvmInternal(format!(
             "failed to find class `{}`",
@@ -28,16 +34,29 @@ pub fn find_method<'jvm>(
 ) -> Result<'jvm, MethodPtr> {
     let class = class.as_ref().as_raw();
 
-    let jni = jvm.as_raw();
-    let method = unsafe { jni.invoke(|jni| jni.GetMethodID, |jni, f| f(jni, class.as_ptr(), jni_name.as_ptr(), jni_descriptor.as_ptr())) };
+    let env = jvm.env();
+    let method = unsafe {
+        env.invoke(
+            |env| env.GetMethodID,
+            |env, f| {
+                f(
+                    env,
+                    class.as_ptr(),
+                    jni_name.as_ptr(),
+                    jni_descriptor.as_ptr(),
+                )
+            },
+        )
+    };
     if let Some(method) = MethodPtr::new(method) {
         Ok(method)
     } else {
-        check_exception(jvm)?; 
+        check_exception(jvm)?;
         // Method not existing should've triggered NoSuchMethodError so something strange is now happening
         Err(crate::Error::JvmInternal(format!(
             "failed to find method `{}` with signature `{}`",
-            jni_name.to_string_lossy(), jni_descriptor.to_string_lossy(),
+            jni_name.to_string_lossy(),
+            jni_descriptor.to_string_lossy(),
         )))
     }
 }

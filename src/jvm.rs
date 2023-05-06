@@ -1,25 +1,16 @@
 use crate::{
     cast::{AsUpcast, TryDowncast, Upcast},
     catch::{CatchNone, Catching},
+    find::find_class,
     inspect::{ArgOp, Inspect},
     java::lang::{Class, ClassExt, Throwable},
     not_null::NotNull,
-    plumbing::convert_non_throw_jni_error,
-    find::find_class, IntoLocal, raw::{ObjectPtr, JniPtr},
+    raw::{self, EnvPtr, HasEnvPtr, JvmPtr, ObjectPtr},
+    thread, Global, IntoLocal, Local,
 };
 
-use std::{
-    env,
-    ffi::CStr,
-    marker::PhantomData,
-    ops::Deref,
-    ptr::NonNull,
-};
+use std::{env, ffi::CStr, path::Path, ptr::NonNull};
 
-use jni::{
-    objects::{AutoLocal, GlobalRef, JObject, JValueOwned},
-    InitArgsBuilder, JNIEnv, JavaVM,
-};
 use once_cell::sync::{Lazy, OnceCell};
 
 /// A "jdk op" is a suspended operation that, when executed, will run
@@ -106,82 +97,69 @@ pub trait JvmOp: Sized {
 pub trait IsVoid: Default {}
 impl IsVoid for () {}
 
-static GLOBAL_JVM: Lazy<JavaVM> = Lazy::new(|| {
-    let mut jvm_builder = InitArgsBuilder::new()
-        .version(jni::JNIVersion::V8)
-        .option("-Xcheck:jni");
-    if let Ok(classpath) = env::var("CLASSPATH") {
-        jvm_builder = jvm_builder.option(format!("-Djava.class.path={classpath}"));
+static GLOBAL_JVM: Lazy<JvmPtr> = Lazy::new(|| {
+    if let Some(jvm) = raw::jvm().unwrap() {
+        return jvm;
     }
-    let jvm_args = jvm_builder.build().unwrap();
 
-    JavaVM::new(jvm_args).unwrap()
+    let mut options = vec!["-Xcheck:jni".to_owned()];
+    if let Ok(classpath) = env::var("CLASSPATH") {
+        options.push(format!("-Djava.class.path={classpath}"));
+    }
+
+    raw::create_jvm(options.iter().map(|s| s.as_str())).unwrap()
 });
 
-#[repr(transparent)]
 pub struct Jvm<'jvm> {
-    env: JNIEnv<'jvm>,
+    jvm: JvmPtr,
+    env: EnvPtr<'jvm>,
+}
+
+impl Jvm<'_> {
+    pub fn attach_thread_permanently() -> crate::GlobalResult<()> {
+        thread::attach_permanently(*GLOBAL_JVM)?;
+        Ok(())
+    }
 }
 
 impl<'jvm> Jvm<'jvm> {
+    pub fn load_libjvm_at(path: impl AsRef<Path>) -> crate::GlobalResult<()> {
+        crate::libjvm::libjvm_or_load_at(path.as_ref())?;
+        Ok(())
+    }
+
     pub fn with<R>(
         op: impl for<'a> FnOnce(&mut Jvm<'a>) -> crate::Result<'a, R>,
     ) -> crate::GlobalResult<R> {
-        let guard = GLOBAL_JVM
-            .attach_current_thread()
-            .map_err(convert_non_throw_jni_error)?;
+        let jvm = *GLOBAL_JVM;
+        let mut guard = unsafe { thread::attach(jvm)? };
 
-        // Safety condition: must not be used to create new references
-        // unless they are contained by `guard`. In this case, the
-        // cloned env is fully contained within the lifetime of `guard`
-        // and basically takes its place. The only purpose here is to
-        // avoid having two lifetime parameters on `Jvm`; trying to
-        // keep the interface simpler.
-        let env = unsafe { guard.unsafe_clone() };
+        let mut jvm = Jvm {
+            jvm,
+            env: guard.env(),
+        };
 
-        op(&mut Jvm { env }).map_err(|e| {
-            e.into_global(&mut Jvm {
-                env: unsafe { guard.unsafe_clone() },
-            })
-        })
-    }
-
-    pub fn to_env(&mut self) -> &mut JNIEnv<'jvm> {
-        &mut self.env
-    }
-
-    // XX
-    pub fn as_raw(&self) -> JniPtr<'jvm> {
-        unsafe {
-            JniPtr::new(self.env.get_raw()).unwrap_unchecked()
-        }
+        op(&mut jvm).map_err(|e| e.into_global(&mut jvm))
     }
 
     pub fn local<R>(&mut self, r: &R) -> Local<'jvm, R>
     where
         R: JavaObject,
     {
-        let jni = self.as_raw();
-        let obj = r.as_raw();
-        // XX: safety of lifetime
-        unsafe {
-            let new_ref = jni.invoke(|jni| jni.NewLocalRef, |jni, f| f(jni, obj.as_ptr()));
-            // XX: new_ref may be nul if we ran out of memory
-            Local::from_raw(jni, NonNull::new(new_ref).unwrap().into())
-        }
+        Local::new(self.env, r)
     }
 
     pub fn global<R>(&mut self, r: &R) -> Global<R>
     where
         R: JavaObject,
     {
-        let jni = self.as_raw();
-        let obj = r.as_raw();
-        unsafe {
-            let new_ref = jni.invoke(|jni| jni.NewGlobalRef, |jni, f| f(jni, obj.as_ptr()));
-            // XX: new_ref may be nul if we ran out of memory
-            Global::from_raw(NonNull::new(new_ref).unwrap().into())
-        }
+        Global::new(self.jvm, self.env, r)
+    }
+}
+
+impl<'jvm> HasEnvPtr<'jvm> for Jvm<'jvm> {
+    fn env(&self) -> EnvPtr<'jvm> {
+        self.env
     }
 }
 
@@ -217,12 +195,11 @@ pub unsafe trait JavaObject: 'static + Sized + JavaType {
 pub trait JavaObjectExt: Sized {
     // We use an extension trait, instead of just declaring these functions on the main JavaObject
     // trait, to prevent trait implementors from overriding the implementation of these functions.
-    
+
     unsafe fn from_raw<'a>(ptr: ObjectPtr) -> &'a Self;
     fn as_raw(&self) -> ObjectPtr;
 }
 impl<T: JavaObject> JavaObjectExt for T {
-
     unsafe fn from_raw<'a>(ptr: ObjectPtr) -> &'a Self {
         // XX: safety
         unsafe { ptr.as_ref() }
@@ -230,9 +207,7 @@ impl<T: JavaObject> JavaObjectExt for T {
 
     fn as_raw(&self) -> ObjectPtr {
         // XX: safety
-        unsafe {
-            NonNull::new_unchecked((self as *const Self).cast_mut()).cast()
-        }.into()
+        unsafe { NonNull::new_unchecked((self as *const Self).cast_mut()).cast() }.into()
     }
 }
 
@@ -283,144 +258,6 @@ scalar! {
     f64:  b"[D\0",
 }
 
-/// An owned local reference to a non-null Java object of type `T`. The reference will be freed when
-/// dropped.
-pub struct Local<'jvm, T: JavaObject> {
-    jni: JniPtr<'jvm>,
-    obj: ObjectPtr,
-    _marker: PhantomData<T>,
-}
-
-impl<T: JavaObject> Drop for Local<'_, T> {
-    fn drop(&mut self) {
-        // XX safety
-        unsafe {
-            self.jni.invoke(|jni| jni.DeleteLocalRef, |jni, f| f(jni, self.obj.as_ptr()));
-        }
-    }
-}
-
-impl<T: JavaObject> Deref for Local<'_, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        // XX: safety
-        unsafe { T::from_raw(self.obj) }
-    }
-}
-
-impl<'jvm, T: JavaObject> Local<'jvm, T> {
-    // XX
-    pub unsafe fn from_raw(jni: JniPtr<'jvm>, ptr: ObjectPtr) -> Self {
-        Self {
-            obj: ptr,
-            jni,
-            _marker: PhantomData,
-        }
-    }
-
-    pub unsafe fn from_jni(_inner: AutoLocal<'jvm, JObject<'jvm>>) -> Self {
-        todo!()
-    }
-}
-
-/// An owned global reference to a non-null Java object of type `T`. The reference will be freed
-/// when dropped.
-/// XX: not wrapped in Arc like jni
-pub struct Global<T: JavaObject> {
-    obj: ObjectPtr,
-    _marker: PhantomData<T>,
-}
-
-// XX: safety
-unsafe impl<T: JavaObject> Send for Global<T> {}
-// XX: safety
-unsafe impl<T: JavaObject> Sync for Global<T> {}
-
-impl<T: JavaObject> Drop for Global<T> {
-    fn drop(&mut self) {
-        let result = Jvm::with(|jvm| {
-            unsafe {
-                jvm.as_raw().invoke(|jni| jni.DeleteGlobalRef, |jni, f| f(jni, self.obj.as_ptr()));
-            }
-            Ok(())
-        });
-        if let Err(_e) = result {
-            // XX debug log
-        }
-    }
-}
-
-impl<T: JavaObject> Deref for Global<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        // XX: safety
-        unsafe { T::from_raw(self.obj) }
-    }
-}
-
-impl<T: JavaObject> Global<T> {
-    unsafe fn from_raw(obj: ObjectPtr) -> Self {
-        Self {
-            obj,
-            _marker: PhantomData,
-        }
-    }
-
-    pub unsafe fn from_jni(inner: GlobalRef) -> Self {
-        Self::from_raw(NonNull::new(inner.as_raw()).unwrap().into())
-    }
-}
-
-impl<'a, R, S> AsRef<S> for Local<'a, R>
-where
-    R: Upcast<S>,
-    S: JavaObject + 'a,
-{
-    fn as_ref(&self) -> &S {
-        // XX: Safety
-        unsafe { S::from_raw(self.obj) }
-    }
-}
-
-impl<'a, R: JavaObject> Local<'a, R> {
-    /// XX: Trying to map onto Into causes impl conflits
-    pub fn upcast<S>(self) -> Local<'a, S>
-    where
-        R: Upcast<S>,
-        S: JavaObject + 'a,
-    {
-        // XX: safety
-        let upcast = unsafe { Local::<S>::from_raw(self.jni, self.obj) };
-        upcast
-    }
-}
-
-impl<R, S> AsRef<S> for Global<R>
-where
-    R: Upcast<S>,
-    S: JavaObject + 'static,
-{
-    fn as_ref(&self) -> &S {
-        // XX: Safety
-        unsafe { S::from_raw(self.obj) }
-    }
-}
-
-impl<R: JavaObject> Global<R> {
-    /// XX: Trying to map onto Into causes impl conflits
-    pub fn upcast<S>(self) -> Global<S>
-    where
-        R: Upcast<S>,
-        S: JavaObject + 'static,
-    {
-        // XX: safety
-        let upcast = unsafe { Global::<S>::from_raw(self.obj) };
-        upcast
-    }
-}
-
 pub trait CloneIn<'jvm> {
     fn clone_in(&self, jvm: &mut Jvm<'jvm>) -> Self;
 }
@@ -431,118 +268,5 @@ where
 {
     fn clone_in(&self, _jvm: &mut Jvm<'_>) -> Self {
         self.clone()
-    }
-}
-
-impl<'jvm, T> CloneIn<'jvm> for Local<'jvm, T>
-where
-    T: JavaObject,
-{
-    fn clone_in(&self, jvm: &mut Jvm<'jvm>) -> Self {
-        jvm.local(self)
-    }
-}
-
-impl<'jvm, T> CloneIn<'jvm> for Global<T>
-where
-    T: JavaObject,
-{
-    fn clone_in(&self, jvm: &mut Jvm<'jvm>) -> Self {
-        jvm.global(self)
-    }
-}
-
-pub trait FromJValue<'jvm> {
-    fn from_jvalue(jvm: &mut Jvm<'jvm>, value: JValueOwned<'jvm>) -> Self;
-}
-
-impl<'jvm, T> FromJValue<'jvm> for Option<Local<'jvm, T>>
-where
-    T: JavaObject,
-{
-    fn from_jvalue(jvm: &mut Jvm<'jvm>, value: JValueOwned<'jvm>) -> Self {
-        match value {
-            jni::objects::JValueGen::Object(o) => {
-                if o.is_null() {
-                    None
-                } else {
-                    let env = jvm.to_env();
-                    Some(unsafe { Local::from_jni(AutoLocal::new(o, &env)) })
-                }
-            }
-            _ => panic!("expected object, found {value:?})"),
-        }
-    }
-}
-
-impl<'jvm> FromJValue<'jvm> for () {
-    fn from_jvalue(_jvm: &mut Jvm<'jvm>, value: JValueOwned<'jvm>) -> Self {
-        match value {
-            jni::objects::JValueGen::Void => (),
-            _ => panic!("expected void, found {value:?})"),
-        }
-    }
-}
-
-impl<'jvm> FromJValue<'jvm> for i32 {
-    fn from_jvalue(_jvm: &mut Jvm<'jvm>, value: JValueOwned<'jvm>) -> Self {
-        match value {
-            jni::objects::JValueGen::Int(i) => i,
-            _ => panic!("expected void, found {value:?})"),
-        }
-    }
-}
-
-impl<'jvm> FromJValue<'jvm> for i64 {
-    fn from_jvalue(_jvm: &mut Jvm<'jvm>, value: JValueOwned<'jvm>) -> Self {
-        match value {
-            jni::objects::JValueGen::Long(i) => i,
-            _ => panic!("expected void, found {value:?})"),
-        }
-    }
-}
-
-impl<'jvm> FromJValue<'jvm> for i8 {
-    fn from_jvalue(_jvm: &mut Jvm<'jvm>, value: JValueOwned<'jvm>) -> Self {
-        match value {
-            jni::objects::JValueGen::Byte(i) => i,
-            _ => panic!("expected void, found {value:?})"),
-        }
-    }
-}
-
-impl<'jvm> FromJValue<'jvm> for i16 {
-    fn from_jvalue(_jvm: &mut Jvm<'jvm>, value: JValueOwned<'jvm>) -> Self {
-        match value {
-            jni::objects::JValueGen::Short(i) => i,
-            _ => panic!("expected void, found {value:?})"),
-        }
-    }
-}
-
-impl<'jvm> FromJValue<'jvm> for bool {
-    fn from_jvalue(_jvm: &mut Jvm<'jvm>, value: JValueOwned<'jvm>) -> Self {
-        match value {
-            jni::objects::JValueGen::Bool(i) => i != 0,
-            _ => panic!("expected void, found {value:?})"),
-        }
-    }
-}
-
-impl<'jvm> FromJValue<'jvm> for f32 {
-    fn from_jvalue(_jvm: &mut Jvm<'jvm>, value: JValueOwned<'jvm>) -> Self {
-        match value {
-            jni::objects::JValueGen::Float(i) => i,
-            _ => panic!("expected void, found {value:?})"),
-        }
-    }
-}
-
-impl<'jvm> FromJValue<'jvm> for f64 {
-    fn from_jvalue(_jvm: &mut Jvm<'jvm>, value: JValueOwned<'jvm>) -> Self {
-        match value {
-            jni::objects::JValueGen::Double(i) => i,
-            _ => panic!("expected void, found {value:?})"),
-        }
     }
 }

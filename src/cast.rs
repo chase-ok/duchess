@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use crate::{jvm::JavaObjectExt, JavaObject, Jvm, JvmOp, Local};
+use crate::{jvm::JavaObjectExt, raw::HasEnvPtr, JavaObject, Jvm, JvmOp, Local};
 
 /// A trait to represent safe upcast operations for a [`JavaObject`].
 ///
@@ -72,10 +72,12 @@ where
         let class = To::class(jvm)?;
         let class_raw = class.as_raw();
 
-        let jni = jvm.as_raw();
+        let env = jvm.env();
         let is_inst = unsafe {
-            jni.invoke(|jni| jni.IsInstanceOf, |jni, f| f(jni, instance_raw.as_ptr(), class_raw.as_ptr()))
-                == jni_sys::JNI_TRUE
+            env.invoke(
+                |env| env.IsInstanceOf,
+                |env, f| f(env, instance_raw.as_ptr(), class_raw.as_ptr()),
+            ) == jni_sys::JNI_TRUE
         };
 
         if is_inst {
@@ -147,8 +149,10 @@ where
 
             let instance_raw = instance.as_ref().as_raw();
             assert!(unsafe {
-                jvm.as_raw().invoke(|jni| jni.IsInstanceOf, |jni, f| f(jni, instance_raw.as_ptr(), class_raw.as_ptr()))
-                    == jni_sys::JNI_TRUE
+                jvm.env().invoke(
+                    |env| env.IsInstanceOf,
+                    |env, f| f(env, instance_raw.as_ptr(), class_raw.as_ptr()),
+                ) == jni_sys::JNI_TRUE
             });
         }
 

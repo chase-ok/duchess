@@ -7,28 +7,28 @@ mod error;
 mod find;
 mod inspect;
 mod jvm;
+mod libjvm;
 mod not_null;
 mod ops;
 mod raw;
+mod ref_;
 mod str;
+mod thread;
 
 /// Contains reusable declarations for classes distributed by the JDK under the `java.*` packages.
 pub mod java;
 
 pub use duchess_macro::java_package;
 pub use error::{Error, GlobalResult, Result};
-pub use jvm::Global;
 pub use jvm::JavaObject;
 pub use jvm::JavaType;
 pub use jvm::Jvm;
-pub use jvm::Local;
+pub use ref_::{Global, Local};
 
 pub use prelude::*;
 
 /// Re-export the dependencies that are used by the generated code.
 pub mod codegen_deps {
-    pub use jni;
-    pub use jni_sys;
     pub use once_cell;
 }
 
@@ -45,8 +45,8 @@ pub mod prelude {
 /// names used by generated code.
 pub mod plumbing {
     pub use crate::cast::Upcast;
-    pub use crate::error::{check_exception, convert_non_throw_jni_error, with_jni_env};
-    pub use crate::find::{find_class, find_method, find_constructor};
-    pub use crate::raw::{IntoJniValue, FromJniValue, MethodPtr, ObjectPtr};
+    pub use crate::error::check_exception;
+    pub use crate::find::{find_class, find_constructor, find_method};
     pub use crate::jvm::JavaObjectExt;
+    pub use crate::raw::{FromJniValue, HasEnvPtr, IntoJniValue, MethodPtr, ObjectPtr};
 }
