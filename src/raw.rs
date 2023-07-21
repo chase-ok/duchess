@@ -399,7 +399,10 @@ pub trait IntoJniValue {
 impl<T: TryJDeref> IntoJniValue for &T {
     fn into_jni_value(self) -> jvalue {
         jvalue {
-            l: self.try_jderef().map(|r| r.as_raw().as_ptr()).unwrap_or(ptr::null_mut())
+            l: self
+                .try_jderef()
+                .map(|r| r.as_raw().as_ptr())
+                .unwrap_or(ptr::null_mut()),
         }
     }
 }
