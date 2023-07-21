@@ -13,7 +13,7 @@ use std::{
 
 use jni_sys::jvalue;
 
-use crate::{jvm::JavaObjectExt, Error, GlobalResult, JavaObject, Jvm, Local};
+use crate::{jvm::JavaObjectExt, Error, GlobalResult, JavaObject, Jvm, Local, TryJDeref};
 
 const VERSION: jni_sys::jint = jni_sys::JNI_VERSION_1_8;
 
@@ -396,18 +396,11 @@ pub trait IntoJniValue {
     fn into_jni_value(self) -> jvalue;
 }
 
-impl<T: JavaObject> IntoJniValue for &T {
+impl<T: TryJDeref> IntoJniValue for &T {
     fn into_jni_value(self) -> jvalue {
         jvalue {
-            l: self.as_raw().as_ptr(),
+            l: self.try_jderef().map(|r| r.as_raw().as_ptr()).unwrap_or(ptr::null_mut())
         }
-    }
-}
-
-impl<T: JavaObject> IntoJniValue for Option<&T> {
-    fn into_jni_value(self) -> jvalue {
-        self.map(|v| v.into_jni_value())
-            .unwrap_or(jvalue { l: ptr::null_mut() })
     }
 }
 

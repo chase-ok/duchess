@@ -539,10 +539,11 @@ impl ClassInfo {
                             ))
                         };
 
+                        check_exception(jvm)?;
+
                         if let Some(obj) = ObjectPtr::new(obj) {
                             Ok(unsafe { Local::from_raw(env, obj) })
                         } else {
-                            check_exception(jvm)?;
                             // NewObjectA should only return a null pointer when an exception occurred in the
                             // constructor, so reaching here is a strange JVM state
                             Err(duchess::Error::JvmInternal(format!(
@@ -1255,7 +1256,6 @@ impl ClassInfo {
                 ),
                 NonRepeatingType::Ref(_) => quote_spanned!(self.span =>
                     let #input_name = self.#input_name.into_java(jvm)?;
-                    let #input_name = #input_name.as_jref()?;
                 ),
             })
             .collect()
