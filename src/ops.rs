@@ -38,8 +38,15 @@ identity_jvm_op! {
     [R: JavaObject] &R,
     [R: JavaObject] &Local<'_, R>,
     [R: JavaObject] &Global<R>,
+
+    // Include useful permutations of Option<{&, Local, Global}> that are Copy, otherwise users are forced to litter
+    // calls with .to_java()
+    [R: JavaObject] &Option<R>,
+    [R: JavaObject] Option<&R>,
     [R: JavaObject] &Option<Local<'_, R>>,
     [R: JavaObject] &Option<Global<R>>,
+    [R: JavaObject] Option<&Local<'_, R>>,
+    [R: JavaObject] Option<&Global<R>>,
 }
 
 /// Types that are able to be used as a Java `T`, either because they will produce a Java `T` (e.g. [`JvmOp`]s that

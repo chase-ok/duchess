@@ -13,13 +13,16 @@ impl JvmOp for &str {
         jvm: &mut Jvm<'jvm>,
     ) -> crate::Result<'jvm, Local<'jvm, JavaString>> {
         let encoded = cesu8::to_java_cesu8(self);
+        dbg!(&encoded);
         // SAFETY: cesu8 encodes interior nul bytes as 0xC080
         let c_string = unsafe { CString::from_vec_unchecked(encoded.into_owned()) };
+        dbg!(&c_string);
 
         let env = jvm.env();
         // SAFETY: c_string is non-null pointer to cesu8-encoded encoded string ending in a trailing nul byte
         let string =
             unsafe { env.invoke(|env| env.NewStringUTF, |env, f| f(env, c_string.as_ptr())) };
+        dbg!(&string);
         if let Some(string) = ObjectPtr::new(string) {
             Ok(unsafe { Local::from_raw(env, string) })
         } else {
@@ -59,6 +62,11 @@ impl IntoRust<String> for &JavaString {
         };
         assert!(cesu8_len >= 0);
 
+        // XX
+        if cesu8_len == 0 {
+            return Ok("".into());
+        }
+
         // SAFETY: same as for cesu8_len
         let utf16_len =
             unsafe { env.invoke(|env| env.GetStringLength, |env, f| f(env, str_raw.as_ptr())) };
@@ -83,6 +91,8 @@ impl IntoRust<String> for &JavaString {
             cesu_bytes.set_len(cesu8_len as usize);
         };
         check_exception(jvm)?;
+
+        dbg!(&cesu_bytes);
 
         // In the common case where there are no surrogate bytes, we can do a (checked) conversion of the Vec into a
         // Rust String. Otherwise, we'll need to use the cesu8 crate to convert properly. Note that this is the same

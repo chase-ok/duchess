@@ -2,7 +2,7 @@ use std::{marker::PhantomData, ops::Deref, ptr::NonNull};
 
 use crate::jvm::JavaObjectExt;
 use crate::thread;
-use crate::{cast::Upcast, jvm::CloneIn, plumbing::ObjectPtr, raw::EnvPtr, JavaObject, Jvm};
+use crate::{cast::Upcast, plumbing::ObjectPtr, raw::EnvPtr, JavaObject, Jvm};
 
 /// An owned local reference to a non-null Java object of type `T`. The reference will be freed when
 /// dropped. Cannot be shared across threads or [`Jvm::with`] invocations.
@@ -197,20 +197,13 @@ impl<R: JavaObject> Global<R> {
     }
 }
 
-impl<'jvm, T> CloneIn<'jvm> for Local<'jvm, T>
-where
-    T: JavaObject,
-{
-    fn clone_in(&self, jvm: &mut Jvm<'jvm>) -> Self {
-        jvm.local(self)
-    }
-}
-
-impl<'jvm, T> CloneIn<'jvm> for Global<T>
-where
-    T: JavaObject,
-{
-    fn clone_in(&self, jvm: &mut Jvm<'jvm>) -> Self {
-        jvm.global(self)
+/// # Panics
+///
+/// Will panic if the JVM has been torn down or has run out of memory to
+/// allocate another GlobalRef. A live `Global` in either scenario is likey to
+/// cause panics elsewhere.
+impl<T: JavaObject> Clone for Global<T> {
+    fn clone(&self) -> Self {
+        Jvm::with(|jvm| Ok(jvm.global(&**self))).unwrap()
     }
 }

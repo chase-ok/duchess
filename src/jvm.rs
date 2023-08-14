@@ -523,16 +523,3 @@ scalar! {
     f32:  b"[F\0",
     f64:  b"[D\0",
 }
-
-pub trait CloneIn<'jvm> {
-    fn clone_in(&self, jvm: &mut Jvm<'jvm>) -> Self;
-}
-
-impl<T> CloneIn<'_> for T
-where
-    T: Clone,
-{
-    fn clone_in(&self, _jvm: &mut Jvm<'_>) -> Self {
-        self.clone()
-    }
-}
