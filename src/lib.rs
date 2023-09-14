@@ -53,7 +53,6 @@ pub mod prelude {
 #[doc(hidden)]
 pub mod plumbing {
     pub use crate::cast::Upcast;
-    pub use crate::error::check_exception;
     pub use crate::find::{find_class, find_constructor, find_field, find_method};
     pub use crate::from_ref::FromRef;
     pub use crate::global::GlobalOp;
@@ -64,7 +63,7 @@ pub mod plumbing {
     pub use crate::link::JavaFn;
     pub use crate::link::JavaFunction;
     pub use crate::raw::{
-        EnvPtr, FieldPtr, FromJniValue, HasEnvPtr, IntoJniValue, MethodPtr, ObjectPtr,
+        EnvPtr, FieldPtr, FromJniValue, IntoJniValue, MethodPtr, ObjectPtr,
     };
     pub use crate::refs::NullJRef;
     pub use crate::to_java::ToJavaImpl;

@@ -2,11 +2,9 @@ use std::marker::PhantomData;
 
 use crate::{
     cast::Upcast,
-    error::check_exception,
     java::{self, lang::Class},
     jvm::JavaView,
     plumbing::{FromRef, JavaObjectExt},
-    raw::{HasEnvPtr, ObjectPtr},
     to_java::ToJavaImpl,
     AsJRef, Error, IntoRust, JDeref, JavaObject, JavaType, Jvm, JvmOp, Local, Nullable,
     ScalarMethod, TryJDeref,
@@ -122,8 +120,9 @@ where
         let this = this.as_jref()?.as_raw();
 
         let len = unsafe {
+            // XX
             jvm.env()
-                .invoke(|env| env.GetArrayLength, |env, f| f(env, this.as_ptr()))
+                .invoke_unchecked(|env| env.GetArrayLength, |env, f| f(env, this.as_ptr()))
         };
         Ok(len)
     }
@@ -141,27 +140,33 @@ macro_rules! primivite_array {
                     };
 
                     let env = jvm.env();
-                    let array = unsafe { env.invoke(|env| env.$new_fn, |env, f| f(env, len)) };
-                    if let Some(array) = ObjectPtr::new(array) {
-                        unsafe {
-                            env.invoke(|env| env.$set_fn, |env, f| f(
-                                env,
-                                array.as_ptr(),
-                                0,
-                                len,
-                                self.as_ptr().cast::<jni_sys::$java_ty>(),
-                            ));
-                        }
+                    let array: Option<Local<JavaArray<$rust>>> = unsafe {
+                        // XX: Safety
+                        env.invoke_checked(|env| env.$new_fn, |env, f| f(env, len))
+                    }?;
 
-                        unsafe { Ok(Local::from_raw(env, array)) }
-                    } else {
-                        check_exception(jvm)?; // Likely threw OutOfMemoryError
+                    let Some(array) = array else {
+                        // OOM should've been caught by the exception check, so we're in
+                        // some strange JVM state
                         return Err(Error::JvmInternal(format!(
                             "failed to allocate `{}[{}]`",
                             $java_name,
                             len
                         )));
+                    };
+
+                    unsafe {
+                        // XX
+                        env.invoke_unchecked(|env| env.$set_fn, |env, f| f(
+                            env,
+                            array.as_raw().as_ptr(),
+                            0,
+                            len,
+                            self.as_ptr().cast::<jni_sys::$java_ty>(),
+                        ));
                     }
+
+                    Ok(array)
                 }
             }
 
@@ -189,7 +194,8 @@ macro_rules! primivite_array {
                     let mut vec = Vec::<$rust>::with_capacity(len as usize);
 
                     unsafe {
-                        jvm.env().invoke(|env| env.$get_fn, |env, f| f(
+                        // XX
+                        jvm.env().invoke_unchecked(|env| env.$get_fn, |env, f| f(
                             env,
                             self.as_raw().as_ptr(),
                             0,
@@ -198,7 +204,6 @@ macro_rules! primivite_array {
                         ));
                         vec.set_len(len as usize);
                     }
-                    check_exception(jvm)?;
 
                     Ok(vec)
                 }

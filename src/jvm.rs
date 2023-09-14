@@ -7,7 +7,7 @@ use crate::{
     link::{IntoJavaFns, JavaFunction},
     not_null::NotNull,
     plumbing::{FromRef, ToJavaImpl},
-    raw::{self, EnvPtr, HasEnvPtr, JvmPtr, ObjectPtr},
+    raw::{self, EnvPtr, JvmPtr, ObjectPtr},
     thread,
     try_catch::TryCatch,
     AsJRef, Error, Global, GlobalResult, IntoRust, Local, ToJava, TryJDeref,
@@ -270,6 +270,12 @@ impl<'jvm> Jvm<'jvm> {
         Global::new(self.0, r)
     }
 
+    /// XX
+    #[doc(hidden)]
+    pub fn env(&self) -> EnvPtr<'jvm> {
+        self.0
+    }
+
     fn register_native_methods(
         &mut self,
         java_functions: &[JavaFunction],
@@ -297,12 +303,6 @@ impl<'jvm> Jvm<'jvm> {
         }
 
         Ok(())
-    }
-}
-
-impl<'jvm> HasEnvPtr<'jvm> for Jvm<'jvm> {
-    fn env(&self) -> EnvPtr<'jvm> {
-        self.0
     }
 }
 
