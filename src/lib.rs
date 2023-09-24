@@ -62,9 +62,7 @@ pub mod plumbing {
     pub use crate::jvm::JavaView;
     pub use crate::link::JavaFn;
     pub use crate::link::JavaFunction;
-    pub use crate::raw::{
-        EnvPtr, FieldPtr, FromJniValue, IntoJniValue, MethodPtr, ObjectPtr,
-    };
+    pub use crate::raw::{EnvPtr, FieldPtr, FromJniValue, IntoJniValue, MethodPtr, ObjectPtr};
     pub use crate::refs::NullJRef;
     pub use crate::to_java::ToJavaImpl;
     pub use jni_sys;

@@ -1,9 +1,7 @@
 use std::marker::PhantomData;
 
 use crate::Jvm;
-use crate::{
-    jvm::JavaObjectExt, refs::AsJRef, JavaObject, JvmOp, Local, TryJDeref,
-};
+use crate::{jvm::JavaObjectExt, refs::AsJRef, JavaObject, JvmOp, Local, TryJDeref};
 
 /// A trait to represent safe upcast operations for a [`JavaObject`].
 ///

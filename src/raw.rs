@@ -229,8 +229,11 @@ impl<'jvm> EnvPtr<'jvm> {
         })
     }
 
-    /// XXX
-    /// Invoke a JNI method dispatched through a virtual table lookup. Used by codegen to make most JNI calls.
+    /// Invoke a JNI method dispatched through a virtual table lookup. Used by codegen to make most JNI calls and so
+    /// must be public.
+    ///
+    /// First invokes [`FromJniValue::from_jni_value()`] before checking for a JVM exception. This allows [`Local`] drop
+    /// code to run and safely decrement the ref count before exiting early on an exception.
     ///
     /// # Safety
     ///
@@ -250,8 +253,9 @@ impl<'jvm> EnvPtr<'jvm> {
         Ok(value)
     }
 
-    /// XXX
-    /// Invoke a JNI method dispatched through a virtual table lookup. Used by codegen to make most JNI calls.
+    /// Invoke a JNI method dispatched through a virtual table lookup. Does *not* check for an exception and should
+    /// only be used when other mechanisms can prove the absence of an exception (e.g. a non-null return value or a
+    /// separate call to [`Self::check_exception()`]).
     ///
     /// # Safety
     ///

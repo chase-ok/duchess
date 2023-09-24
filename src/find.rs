@@ -12,7 +12,7 @@ pub fn find_class<'jvm>(
     jni_name: &CStr,
 ) -> Result<'jvm, Local<'jvm, java::lang::Class>> {
     let class: Option<Local<java::lang::Class>> = unsafe {
-        // XX Safety
+        // SAFETY: jni_name is a valid pointer to a nul-terminated byte string
         jvm.env()
             .invoke_checked(|env| env.FindClass, |env, f| f(env, jni_name.as_ptr()))
     }?;
@@ -54,7 +54,7 @@ pub fn find_method<'jvm>(
             },
         )
     };
-    // XX: Gaurantee about method IDs being non-zero
+    // JVM guarantees that valid method IDs are non-null, so the null check here suffices
     if let Some(method) = MethodPtr::new(method) {
         Ok(method)
     } else {
@@ -97,7 +97,7 @@ pub fn find_field<'jvm>(
             },
         )
     };
-    // XX: Gaurantee about field IDs being non-zero
+    // JVM guarantees that valid field IDs are non-null, so the null check here suffices
     if let Some(field) = FieldPtr::new(field) {
         Ok(field)
     } else {

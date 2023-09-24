@@ -1,8 +1,8 @@
 use std::ffi::{c_char, CString};
 
 use crate::{
-    into_rust::IntoRust, java::lang::String as JavaString, jvm::JavaObjectExt,
-    Error, Jvm, JvmOp, Local,
+    into_rust::IntoRust, java::lang::String as JavaString, jvm::JavaObjectExt, Error, Jvm, JvmOp,
+    Local,
 };
 
 impl JvmOp for &str {

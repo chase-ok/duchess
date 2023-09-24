@@ -19,7 +19,6 @@ use std::{
     ffi::{c_char, c_void, CStr},
     fmt::Display,
     panic::AssertUnwindSafe,
-    ptr::NonNull,
 };
 
 use once_cell::sync::OnceCell;
@@ -270,7 +269,7 @@ impl<'jvm> Jvm<'jvm> {
         Global::new(self.0, r)
     }
 
-    /// XX
+    /// Plumbing method that should only be used by generated and internal code.
     #[doc(hidden)]
     pub fn env(&self) -> EnvPtr<'jvm> {
         self.0
@@ -463,14 +462,29 @@ pub trait JavaObjectExt: Sized {
 }
 
 impl<T: JavaObject> JavaObjectExt for T {
+    /// # Safety
+    ///
+    /// The caller must ensure that the pointed-to object remains live through `'a` and is an instance of `T` (or its
+    /// subclasses).
     unsafe fn from_raw<'a>(ptr: ObjectPtr) -> &'a Self {
-        // XX: safety
+        // SAFETY: The cast is sound because:
+        //
+        // 1. A pointer to a suitably aligned `sys::_jobject` should also satisfy Self's alignment
+        //    requirement (trait rule #3)
+        // 2. Self is a zero-sized type (trait rule #1), so there are no invalid bit patterns to
+        //    worry about.
+        // 3. Self is a zero-sized type (trait rule #1), so there's no actual memory region that is
+        //    subject to the aliasing rules.
         unsafe { ptr.as_ref() }
     }
 
     fn as_raw(&self) -> ObjectPtr {
-        // XX: safety
-        unsafe { NonNull::new_unchecked((self as *const Self).cast_mut()).cast() }.into()
+        let ptr: *const Self = self;
+        let jobj = ptr.cast_mut().cast::<jni_sys::_jobject>();
+        // SAFETY: From JavaObject trait contract, T is a non-constructable, zero-sized type. The only way to obtain a
+        // &T is through from_raw() given a valid JNI object pointer. from_raw() callers are responsible for ensuring
+        // the lifetime of the borrow isn't longer than the lifetime of the java local or global it points to.
+        unsafe { ObjectPtr::new(jobj).unwrap_unchecked() }
     }
 }
 

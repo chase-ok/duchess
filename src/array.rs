@@ -120,7 +120,6 @@ where
         let this = this.as_jref()?.as_raw();
 
         let len = unsafe {
-            // XX
             jvm.env()
                 .invoke_unchecked(|env| env.GetArrayLength, |env, f| f(env, this.as_ptr()))
         };
@@ -141,13 +140,12 @@ macro_rules! primivite_array {
 
                     let env = jvm.env();
                     let array: Option<Local<JavaArray<$rust>>> = unsafe {
-                        // XX: Safety
+                        // SAFETY: env points to an attached JNI
                         env.invoke_checked(|env| env.$new_fn, |env, f| f(env, len))
                     }?;
 
                     let Some(array) = array else {
-                        // OOM should've been caught by the exception check, so we're in
-                        // some strange JVM state
+                        // NewArray should never return null unless an exception occurred (which we've already checked)
                         return Err(Error::JvmInternal(format!(
                             "failed to allocate `{}[{}]`",
                             $java_name,
@@ -156,7 +154,7 @@ macro_rules! primivite_array {
                     };
 
                     unsafe {
-                        // XX
+                        // SAFETY: we allocated an array with the same len and type as self
                         env.invoke_unchecked(|env| env.$set_fn, |env, f| f(
                             env,
                             array.as_raw().as_ptr(),
@@ -194,7 +192,7 @@ macro_rules! primivite_array {
                     let mut vec = Vec::<$rust>::with_capacity(len as usize);
 
                     unsafe {
-                        // XX
+                        // SAFETY: $rust is a Copy type and vec has at least as much capacity as the JVM array
                         jvm.env().invoke_unchecked(|env| env.$get_fn, |env, f| f(
                             env,
                             self.as_raw().as_ptr(),
